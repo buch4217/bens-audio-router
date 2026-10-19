@@ -2,7 +2,7 @@
 
 # Bens Audio Router
 
-![Lizenz](https://img.shields.io/badge/Lizenz-MIT-blue) ![Plattform](https://img.shields.io/badge/Plattform-Windows%2010%2F11%20x64-0078d4) ![Version](https://img.shields.io/badge/Version-4.1-brightgreen) ![Status](https://img.shields.io/badge/Status-Open%20Source-orange)
+![Lizenz](https://img.shields.io/badge/Lizenz-MIT-blue) ![Plattform](https://img.shields.io/badge/Plattform-Windows%2010%2F11%20x64-0078d4) ![Version](https://img.shields.io/badge/Version-4.2-brightgreen) ![Status](https://img.shields.io/badge/Status-Open%20Source-orange)
 
 **Audiophiler Node-Router für Windows – Mitschnitt, lokale Ausgänge und Sonos-Streaming mit automatischem Latenz-Ausgleich.**
 
@@ -29,7 +29,9 @@ einer Quelle zu mehreren Ausgängen – zum Beispiel vom PC zum lokalen Studio *
 | **Autopilot & Einmessen** | Latenz wird gemessen (Mikrofon-Messsweep, Sonos-Position) und automatisch ausgeglichen; Feinkorrektur manuell |
 | **Virtuelles Gerät** | Assistent für VB-Audio HIFI-CABLE / VB-CABLE: verkabelt alles, schaltet Windows um, stellt beim Beenden zurück |
 | **Layouts** | Konfigurationen als `.bar`-Dateien speichern und laden („Party“, „Alltag“ …) |
-| **AirPlay-Empfänger** | iPhone/iPad/Mac spielen direkt in den Router (AirPlay 1/RAOP, ALAC 16 Bit/44,1 kHz), Name und Latenz einstellbar |
+| **AirPlay-Empfänger** | iPhone/iPad/Mac spielen nativ per AirPlay direkt in den Router (mit Apple-Geräten getestet; AirPlay 1/RAOP, ALAC 16 Bit/44,1 kHz), Name und Latenz einstellbar |
+| **Aufnahme-Box** | Zeichnet das gemischte Signal als **WAV** (16/24 Bit, 32 Bit Float) oder **FLAC** (16/24 Bit, verlustfrei) auf, 44,1–96 kHz. Per Drag & Drop aus der Toolbar aufs Feld ziehen, Quellen verbinden, **● REC**. Immer **genau eine Datei** pro Aufnahme (WAV ab 4 GB automatisch RF64), eigener Schreib-Thread, absturzsicherer Header |
+| **Summen-Modul** | Für Mono-Eingänge: zwei Mono-Quellen werden als **Links/Rechts** zugeordnet (je Kabel: Kanal der Quelle → Links, Rechts, Mitte oder Stereo). Beim Mischen aufgelöst: **keine zusätzliche Latenz**, der Autopilot rechnet wie mit direkten Kabeln |
 | **Modernes UI** | Natives Dark-Mode (auch Titelleiste und Menüs), Auto/Dunkel/Hell |
 
 ## Download
@@ -63,13 +65,12 @@ sudo apt install g++-mingw-w64-x86-64
 cd src && ./build.sh        # erzeugt BensAudioRouter.exe
 ```
 
-Aufbau: `BensAudioRouter.cpp` (App), `core.h` (DSP), `flac.h` (FLAC-Encoder), `calib.h` (Einmessung), `stream.h` (Sonos/UPnP/HTTP), `airplay.h` + `ap_crypto.h` (AirPlay-Empfänger), `alac.c` (ALAC-Decoder),
+Aufbau: `BensAudioRouter.cpp` (App), `core.h` (DSP), `flac.h` (FLAC-Encoder), `calib.h` (Einmessung), `stream.h` (Sonos/UPnP/HTTP), `airplay.h` + `ap_crypto.h` (AirPlay-Empfänger), `alac.c` (ALAC-Decoder), `wavrec.h` (WAV/FLAC-Rekorder der Aufnahme-Box), `route.h` (Kanal-Matrix des Summen-Moduls),
 `ui.h` (Theme und Controls), `tests/` (Kern-Tests), `tools/mock_sonos.py` (Sonos-Simulator) und `tools/raop_test_sender.py` (AirPlay-Testsender).
 
 ## Status und Roadmap
 
-- **AirPlay-Empfänger (AirPlay 1 / RAOP)** ist in 4.1 enthalten und mit einem eigenen Testsender geprüft (Challenge, Verschlüsselung, ALAC, Paketverlust mit Resend, mDNS).
-  **Tests mit echten Apple-Geräten stehen noch aus.**
+- **AirPlay-Empfänger (AirPlay 1 / RAOP)** ist mit Apple-Geräten getestet und arbeitet dort nativ (der Router erscheint direkt in der AirPlay-Auswahl). Zusätzlich mit einem eigenen Testsender geprüft (Challenge, Verschlüsselung, ALAC, Paketverlust mit Resend, mDNS). Rückmeldungen zu weiteren Geräten und iOS-/macOS-Versionen sind willkommen.
 - **AirPlay 2** (Empfänger und Sender) ist **nicht** enthalten: HomeKit-Pairing, ChaCha20, PTP, AAC und FairPlay sind sehr umfangreich, die Referenzimplementierung unterstützt Windows nicht, und ohne reale Gegengeräte wäre das Ergebnis nicht überprüfbar.
 - Geplant: AirPlay-1-Sender (Router → AirPlay-Lautsprecher); AirPlay 2 erst mit einem Zielgerät zum Testen.
 - Sonos Connect (Gen 2, 2015) unterstützt kein AirPlay (Herstellerangabe); AirPlay-fähige Sonos-Geräte lassen sich per UPnP-Gruppe einbinden.
