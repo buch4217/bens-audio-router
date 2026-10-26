@@ -1,0 +1,71 @@
+// Rauchtest der Web-Oberflaeche ohne Browser: simuliertes DOM, echte index.html. Faengt Laufzeitfehler in allen Reitern, Sheets und Befehlswegen ab.
+const { test } = require('node:test'), assert = require('node:assert/strict'), fs = require('fs'), path = require('path');
+const js = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8').match(/<script>([\s\S]*)<\/script>/)[1];
+class Txt { constructor(t) { this.nodeType = 3; this.data = String(t ?? '') } }
+class El { constructor(tag) { this.nodeType = 1; this.tag = tag; this.children = []; this.attrs = {}; this.listeners = {}; this.style = { cssText: '', setProperty() { }, width: '' }; this.className = ''; this.value = '0'; this.isConnected = true; this.scrollTop = 0; this.clientWidth = 390; this.clientHeight = 600; this.offsetX = 0 }
+  append(...k) { for (const c of k) this.children.push(c && c.nodeType ? c : new Txt(c)) } replaceChildren(...k) { this.children = []; this.append(...k) } setAttribute(k, v) { this.attrs[k] = String(v); if (k === 'id') this.id = v } addEventListener(t, f) { (this.listeners[t] = this.listeners[t] || []).push(f) }
+  walk(f) { f(this); for (const c of this.children) if (c.walk) c.walk(f) } find(p) { let r = null; this.walk(e => { if (!r && p(e)) r = e }); return r } all(p) { const r = []; this.walk(e => { if (p(e)) r.push(e) }); return r }
+  matches(sel) { return sel.startsWith('.') ? (this.className || '').split(' ').includes(sel.slice(1)) : this.tag === sel } querySelector(s) { return this.find(e => e !== this && e.matches(s)) } querySelectorAll(s) { return this.all(e => e !== this && e.matches(s)) }
+  remove() { this.isConnected = false; if (this.parent) this.parent.children = this.parent.children.filter(c => c !== this) } setPointerCapture() { } set innerHTML(v) { this._h = v } get textContent() { return this._t ?? this.text() } set textContent(v) { this._t = v } text() { return this.children.map(c => c.data ?? c.text()).join('') }
+  fire(t, ev = {}) { for (const f of this.listeners[t] || []) f({ target: this, pointerId: 1, offsetX: 5, offsetY: 5, preventDefault() { }, ...ev }) } }
+function boot(stateResp) {
+  const body = new El('body'), root = new El('div'); root.id = 'app'; body.append(root); const sent = [], toasts = [];
+  const doc = { createElement: t => new El(t), createElementNS: (n, t) => new El(t), createTextNode: t => new Txt(t), getElementById: id => id === 'app' ? root : body.find(e => e.id === id), querySelector: s => body.find(e => e !== body && e.matches(s)), querySelectorAll: s => body.all(e => e !== body && e.matches(s)), body: { append: e => { e.parent = body; body.append(e) } } };
+  const origAppend = body.append.bind(body); const ws = { readyState: 1, sent, send(m) { sent.push(typeof m === 'string' ? JSON.parse(m) : m) }, bufferedAmount: 0 };
+  const env = { document: doc, localStorage: {}, location: { host: 'x:8443', hash: '', pathname: '/', protocol: 'https:', reload() { } }, history: { replaceState() { } }, navigator: { userAgent: 'iPhone', vibrate() { } }, confirm: () => true, requestAnimationFrame: f => setTimeout(f, 0),
+    fetch: async () => stateResp, WebSocket: function () { return ws } };
+  new Function(...Object.keys(env), js)(...Object.values(env)); return { root, body, ws, sent, doc };
+}
+const nd = (id, kind, name, extra = {}) => ({ id, kind, name, x: 50 + id * 20, y: 100 + id * 40, ports: ['out', 'sum', 'loop', 'cap', 'gen', 'air'].includes(kind) ? (kind === 'sum' ? 'both' : 'out') : 'in', gain: 0, mute: false, delay: 0, dly: 0, trim: 0, status: '48000 Hz', sumMono: false, ...extra });
+const state = () => ({ t: 'state', ver: '4.5', running: true, autopilot: true, scenes: ['Party'], devices: [{ id: 'a', name: 'iPhone', me: true }], hw: { cap: [{ id: 'c1', name: 'Mikrofon' }], out: [{ id: 'o1', name: 'DCX' }] }, mic: { on: false, exists: false }, cal: { busy: false, msg: 'Fertig' },
+  engine: { running: true }, global: { pad: 30, base: 50, poll: 2, drv: 50, opts: { pad: [10, 20, 30, 50, 100], base: [10, 20, 50], poll: [1, 2, 3, 5], drv: [20, 50, 100, 200] } }, sonosFound: [{ ip: '192.168.0.21', name: 'Wohnzimmer', model: 'Sonos Connect' }, { ip: '192.168.0.22', name: 'Küche', model: 'Sonos One' }], msg: '',
+  nodes: [nd(1, 'loop', 'Mitschnitt: CABLE Input (VB-Audio Virtual Cable)', { status: '192000 Hz' }), nd(2, 'cap', 'Mikro', { gain: -6, dly: 5 }), nd(3, 'sum', 'Summe', { mute: true, sumMono: true }),
+    nd(4, 'out', 'DCX (Minifuse 1)', { delay: 1783, dly: 1783, trim: 0.3, ext: 0, lat: { total: 1800.5, err: 3.2, src: 'Einmessung (Mikrofon)' } }),
+    nd(5, 'stream', 'Sonos', { delay: 100, dly: 100, ext: 12, lat: { total: 1900, err: 20, src: 'Sonos-Positionsmessung' }, zones: [{ name: 'Wohnzimmer', vol: .4 }, { name: 'Küche', vol: .2 }], p: { port: 8100, scheme: 0, rate: 44100, burst: 2000, fmt: 0, volCtl: true, dither: false, autoLat: true, vol: 25, play: true, ctl: 0, ip: '192.168.0.21', room: 'Wohnzimmer', group: [{ ip: '192.168.0.22', name: 'Küche' }] } }),
+    nd(6, 'rec', 'Aufnahme-Box', { rec: { on: true, sec: 65, bytes: 3e6, fmt: 'FLAC 24 Bit' }, p: { fmt: 1, rate: 48000, dir: 'C:\\Aufnahmen' } }), nd(7, 'gen', 'Test: Sinus', { p: { gen: 1 } }), nd(8, 'air', 'AirPlay: Bens Audio Router', { p: { port: 7000, buf: 500, latAuto: false, latMs: 150, useVol: true, name: 'Bens Audio Router' } })],
+  conns: [{ id: 1, src: 1, dst: 4, srcCh: 0, dstCh: 0, lag: 30 }, { id: 2, src: 2, dst: 3, srcCh: 3, dstCh: 1, lag: 30 }, { id: 3, src: 3, dst: 5, srcCh: 0, dstCh: 0, lag: 30 }] });
+const wait = ms => new Promise(r => setTimeout(r, ms));
+test('Start, alle Reiter rendern, Meter, Befehle, Sheets (ohne Laufzeitfehler)', async () => {
+  const { root, body, ws, sent } = boot({ status: 200, ok: true, json: async () => state() }); await wait(30); ws.onopen && ws.onopen(); ws.onmessage({ data: JSON.stringify(state()) });
+  const main = () => body.find(e => e.id === 'main'); assert.ok(main(), 'Hauptbereich'); const nav = () => body.find(e => e.tag === 'nav').children;
+  assert.equal(nav().length, 6); assert.match(main().text(), /Timing/); assert.match(main().text(), /Mitschnitt: CABLE Input/); assert.ok(body.find(e => e.id === 'addbtn'), 'Hinzufuegen-Knopf im Kopf');
+  ws.onmessage({ data: JSON.stringify({ t: 'm', a: [[1, -12.3, -13, 0], [4, -90, -90, 0]] }) }); const db = body.all(e => e.className === 'db'); assert.equal(db[0].textContent, '-12.3'); assert.equal(db[3].textContent, '−∞');
+  // jeder Reiter + jeder Knopf darin
+  const errors = []; const clickAll = scope => { for (const e of scope.all(e => e.listeners && e.listeners.click)) { try { e.fire('click') } catch (x) { errors.push(x.message + ' @' + (e.className || e.tag)) } } };
+  for (let i = 0; i < 6; i++) { nav()[i].fire('click'); await wait(10); assert.ok(main().children.length > 0, 'Reiter ' + i + ' leer'); clickAll(main()); clickAll(body); body.children = body.children.filter(c => !(c.className || '').includes('sheet') && !(c.className || '').includes('toast')); }
+  assert.deepEqual(errors, [], 'Laufzeitfehler: ' + errors.join('; '));
+  const ops = new Set(sent.filter(m => m.t === 'cmd').map(m => m.op)); for (const o of ['mute', 'autopilot', 'trim', 'connect', 'disconnect', 'scene', 'rec', 'sumMono']) assert.ok(ops.has(o), 'Befehl ' + o + ' wurde nie gesendet');
+});
+test('Fader: Gain-Befehl bis 0 dB, Doppeltippen setzt auf 0 zurueck', async () => {
+  const { body, ws, sent } = boot({ status: 200, ok: true, json: async () => state() }); await wait(30); const r = body.all(e => e.attrs.type === 'range')[1]; assert.ok(r, 'Regler'); // zweiter = Mikro (-6 dB)
+  assert.equal(r.attrs.max, '1000'); r.value = '500'; r.oninput(); await wait(5); const g = sent.filter(m => m.op === 'gain').pop(); assert.equal(g.db, -30); assert.equal(g.node, 2);
+  sent.length = 0; r.fire('pointerdown'); r.fire('pointerup'); r.fire('pointerdown'); r.fire('pointerup'); const z = sent.filter(m => m.op === 'gain').pop(); assert.ok(z && z.db === 0, 'Doppeltipp -> 0 dB'); assert.equal(String(r.value), '1000');
+  r.value = '1000'; r.oninput(); assert.ok(sent.every(m => m.db === undefined || m.db <= 0), 'nie Pluspegel');
+});
+test('Nicht gekoppelt: Koppel-Ansicht mit Code-Feld', async () => { const { body } = boot({ status: 401, ok: false, json: async () => ({}) }); await wait(30); const pair = body.find(e => e.id === 'pair'); assert.ok(pair, 'Koppel-Ansicht'); assert.ok(pair.find(e => e.id === 'code'), 'Code-Feld'); assert.match(pair.text(), /Koppeln/); });
+
+test('Voller Umfang: System-Reiter und Node-Einstellungen senden die richtigen Befehle', async () => {
+  const { body, ws, sent } = boot({ status: 200, ok: true, json: async () => state() }); await wait(30); ws.onopen && ws.onopen(); const nav = () => body.find(e => e.tag === 'nav').children, main = () => body.find(e => e.id === 'main'); const last = op => sent.filter(m => m.op === op).pop();
+  nav()[5].fire('click'); await wait(10); assert.match(main().text(), /Engine/); assert.match(main().text(), /Sonos-Zonen im Netz/); assert.match(main().text(), /Synchronisation/); assert.match(main().text(), /1800\.5 ms ± 3\.2/);
+  const sels = main().all(e => e.tag === 'select'); assert.equal(sels.length, 4, 'vier Puffer-Auswahlen'); sels[0].value = '50'; sels[0].onchange(); assert.deepEqual([last('global').key, last('global').value], ['pad', 50]); sels[3].value = '100'; sels[3].onchange(); assert.deepEqual([last('global').key, last('global').value], ['drv', 100]);
+  const btn = t => main().find(e => e.tag === 'button' && e.text().includes(t)); btn('Stopp').fire('click'); assert.equal(last('engine').on, false); btn('Geräte neu einlesen').fire('click'); assert.equal(last('act').name, 'rescan'); btn('Sonos suchen').fire('click'); assert.equal(last('act').name, 'sonosSearch');
+  btn('Assistent').fire('click'); assert.equal(last('act').name, 'vdevSetup'); btn('Standard zurücksetzen').fire('click'); assert.equal(last('act').name, 'vdevRestore'); btn('Einmessen starten').fire('click'); assert.equal(last('act').name, 'calibrateLocal'); main().all(e => e.tag === 'button' && e.text() === 'Stream anlegen')[1].fire('click'); assert.equal(last('addStream').ip, '192.168.0.22');
+  nav()[0].fire('click'); await wait(10); const mores = body.all(e => e.attrs['aria-label'] === 'Mehr'); assert.equal(mores.length, 8);
+  const open = i => { mores[i].fire('click'); const sh = body.find(e => (e.className || '') === 'sheet'); assert.ok(sh, 'Menue ' + i); return sh };
+  let sh = open(4); assert.match(sh.text(), /Latenz bis zum Ohr/); assert.match(sh.text(), /Gruppe \(weitere Zonen\)/); const zone = sh.all(e => e.tag === 'select').find(e => e.text().includes('Wohnzimmer (192.168.0.21)')); zone.value = '192.168.0.22'; zone.onchange(); assert.deepEqual([last('sonosPick').node, last('sonosPick').ip], [5, '192.168.0.22']);
+  const ip = sh.all(e => e.tag === 'input' && e.attrs.type === 'text')[0]; ip.value = ' 192.168.0.50 '; ip.onchange(); assert.deepEqual([last('setProp').node, last('setProp').key, last('setProp').value], [5, 'ip', '192.168.0.50']);
+  const port = sh.all(e => e.tag === 'input' && e.attrs.type === 'number')[1]; port.value = '8200'; port.onchange(); assert.deepEqual([last('setProp').key, last('setProp').value], ['port', 8200]);
+  const tg = sh.all(e => e.tag === 'button' && (e.attrs['aria-label'] || '').includes('Dither'))[0]; tg.fire('click'); assert.deepEqual([last('setProp').key, last('setProp').value], ['dither', true]);
+  const fmtSel = sh.all(e => e.tag === 'select').find(e => e.text().includes('FLAC 24 Bit (verlustfrei')); fmtSel.value = '1'; fmtSel.onchange(); assert.deepEqual([last('setProp').key, last('setProp').value], ['fmt', 1]);
+  sh.all(e => e.tag === 'button' && e.text() === 'Gruppe leeren')[0].fire('click'); assert.equal(last('groupClear').node, 5); sh.all(e => e.tag === 'button' && e.text() === 'Neu verbinden')[0].fire('click'); assert.equal(last('reconnect').node, 5);
+  body.children = body.children.filter(c => (c.className || '') !== 'sheet'); sh = open(5); assert.match(sh.text(), /Aufnahme/); const rf = sh.all(e => e.tag === 'select').find(e => e.text().includes('FLAC 16 Bit')); rf.value = '2'; rf.onchange(); assert.deepEqual([last('setProp').node, last('setProp').key, last('setProp').value], [6, 'fmt', 2]);
+  body.children = body.children.filter(c => (c.className || '') !== 'sheet'); sh = open(7); assert.match(sh.text(), /AirPlay/); const bf = sh.all(e => e.tag === 'input' && e.attrs.type === 'number')[1]; bf.value = '300'; bf.onchange(); assert.deepEqual([last('setProp').node, last('setProp').key, last('setProp').value], [8, 'buf', 300]);
+  body.children = body.children.filter(c => (c.className || '') !== 'sheet'); sh = open(6); const gs = sh.all(e => e.tag === 'select')[0]; gs.value = '2'; gs.onchange(); assert.deepEqual([last('setProp').node, last('setProp').key, last('setProp').value], [7, 'gen', 2]);
+  body.children = body.children.filter(c => (c.className || '') !== 'sheet'); sh = open(3); const ext = sh.all(e => e.tag === 'input' && e.attrs.type === 'number')[0]; ext.value = '7.5'; ext.onchange(); assert.deepEqual([last('setProp').node, last('setProp').key, last('setProp').value], [4, 'ext', 7.5]);
+  nav()[4].fire('click'); await wait(10); main().find(e => e.tag === 'button' && e.text() === 'Löschen').fire('click'); assert.equal(last('sceneDelete').name, 'Party');
+});
+test('Statusmeldungen der App erscheinen als Hinweis, offenes Node-Menue wird aktualisiert', async () => {
+  const { body, ws } = boot({ status: 200, ok: true, json: async () => ({ ...state(), msg: 'alt' }) }); await wait(30); ws.onopen && ws.onopen(); ws.onmessage({ data: JSON.stringify({ ...state(), msg: 'alt' }) }); assert.equal(body.find(e => (e.className || '') === 'toast'), null, 'alte Meldung nicht erneut zeigen');
+  ws.onmessage({ data: JSON.stringify({ ...state(), msg: 'Zone zur Gruppe hinzugefügt' }) }); const t = body.find(e => (e.className || '') === 'toast'); assert.ok(t); assert.match(t.text(), /Zone zur Gruppe/);
+  body.all(e => e.attrs['aria-label'] === 'Mehr')[4].fire('click'); const st = state(); st.nodes[4].p.group = []; ws.onmessage({ data: JSON.stringify(st) }); const sh = body.find(e => (e.className || '') === 'sheet'); assert.ok(sh, 'Menue bleibt offen'); assert.match(sh.text(), /Keine weiteren Zonen/);
+});
