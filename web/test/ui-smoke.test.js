@@ -28,11 +28,11 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
 test('Start, alle Reiter rendern, Meter, Befehle, Sheets (ohne Laufzeitfehler)', async () => {
   const { root, body, ws, sent } = boot({ status: 200, ok: true, json: async () => state() }); await wait(30); ws.onopen && ws.onopen(); ws.onmessage({ data: JSON.stringify(state()) });
   const main = () => body.find(e => e.id === 'main'); assert.ok(main(), 'Hauptbereich'); const nav = () => body.find(e => e.tag === 'nav').children;
-  assert.equal(nav().length, 6); assert.match(main().text(), /Timing/); assert.match(main().text(), /Mitschnitt: CABLE Input/); assert.ok(body.find(e => e.id === 'addbtn'), 'Hinzufuegen-Knopf im Kopf');
+  assert.equal(nav().length, 7); assert.match(main().text(), /Timing/); assert.match(main().text(), /Mitschnitt: CABLE Input/); assert.ok(body.find(e => e.id === 'addbtn'), 'Hinzufuegen-Knopf im Kopf');
   ws.onmessage({ data: JSON.stringify({ t: 'm', a: [[1, -12.3, -13, 0], [4, -90, -90, 0]] }) }); const db = body.all(e => e.className === 'db'); assert.equal(db[0].textContent, '-12.3'); assert.equal(db[3].textContent, '−∞');
   // jeder Reiter + jeder Knopf darin
   const errors = []; const clickAll = scope => { for (const e of scope.all(e => e.listeners && e.listeners.click)) { try { e.fire('click') } catch (x) { errors.push(x.message + ' @' + (e.className || e.tag)) } } };
-  for (let i = 0; i < 6; i++) { nav()[i].fire('click'); await wait(10); assert.ok(main().children.length > 0, 'Reiter ' + i + ' leer'); clickAll(main()); clickAll(body); body.children = body.children.filter(c => !(c.className || '').includes('sheet') && !(c.className || '').includes('toast')); }
+  for (let i = 0; i < 7; i++) { nav()[i].fire('click'); await wait(10); assert.ok(main().children.length > 0, 'Reiter ' + i + ' leer'); clickAll(main()); clickAll(body); body.children = body.children.filter(c => !(c.className || '').includes('sheet') && !(c.className || '').includes('toast')); }
   assert.deepEqual(errors, [], 'Laufzeitfehler: ' + errors.join('; '));
   const ops = new Set(sent.filter(m => m.t === 'cmd').map(m => m.op)); for (const o of ['mute', 'autopilot', 'trim', 'connect', 'disconnect', 'scene', 'rec', 'sumMono']) assert.ok(ops.has(o), 'Befehl ' + o + ' wurde nie gesendet');
 });
@@ -46,7 +46,7 @@ test('Nicht gekoppelt: Koppel-Ansicht mit Code-Feld', async () => { const { body
 
 test('Voller Umfang: System-Reiter und Node-Einstellungen senden die richtigen Befehle', async () => {
   const { body, ws, sent } = boot({ status: 200, ok: true, json: async () => state() }); await wait(30); ws.onopen && ws.onopen(); const nav = () => body.find(e => e.tag === 'nav').children, main = () => body.find(e => e.id === 'main'); const last = op => sent.filter(m => m.op === op).pop();
-  nav()[5].fire('click'); await wait(10); assert.match(main().text(), /Engine/); assert.match(main().text(), /Sonos-Zonen im Netz/); assert.match(main().text(), /Synchronisation/); assert.match(main().text(), /1800\.5 ms ± 3\.2/);
+  nav()[6].fire('click'); await wait(10); assert.match(main().text(), /Engine/); assert.match(main().text(), /Sonos-Zonen im Netz/); assert.match(main().text(), /Synchronisation/); assert.match(main().text(), /1800\.5 ms ± 3\.2/);
   const sels = main().all(e => e.tag === 'select'); assert.equal(sels.length, 4, 'vier Puffer-Auswahlen'); sels[0].value = '50'; sels[0].onchange(); assert.deepEqual([last('global').key, last('global').value], ['pad', 50]); sels[3].value = '100'; sels[3].onchange(); assert.deepEqual([last('global').key, last('global').value], ['drv', 100]);
   const btn = t => main().find(e => e.tag === 'button' && e.text().includes(t)); btn('Stopp').fire('click'); assert.equal(last('engine').on, false); btn('Geräte neu einlesen').fire('click'); assert.equal(last('act').name, 'rescan'); btn('Sonos suchen').fire('click'); assert.equal(last('act').name, 'sonosSearch');
   btn('Assistent').fire('click'); assert.equal(last('act').name, 'vdevSetup'); btn('Standard zurücksetzen').fire('click'); assert.equal(last('act').name, 'vdevRestore'); btn('Einmessen starten').fire('click'); assert.equal(last('act').name, 'calibrateLocal'); main().all(e => e.tag === 'button' && e.text() === 'Stream anlegen')[1].fire('click'); assert.equal(last('addStream').ip, '192.168.0.22');
@@ -68,4 +68,53 @@ test('Statusmeldungen der App erscheinen als Hinweis, offenes Node-Menue wird ak
   const { body, ws } = boot({ status: 200, ok: true, json: async () => ({ ...state(), msg: 'alt' }) }); await wait(30); ws.onopen && ws.onopen(); ws.onmessage({ data: JSON.stringify({ ...state(), msg: 'alt' }) }); assert.equal(body.find(e => (e.className || '') === 'toast'), null, 'alte Meldung nicht erneut zeigen');
   ws.onmessage({ data: JSON.stringify({ ...state(), msg: 'Zone zur Gruppe hinzugefügt' }) }); const t = body.find(e => (e.className || '') === 'toast'); assert.ok(t); assert.match(t.text(), /Zone zur Gruppe/);
   body.all(e => e.attrs['aria-label'] === 'Mehr')[4].fire('click'); const st = state(); st.nodes[4].p.group = []; ws.onmessage({ data: JSON.stringify(st) }); const sh = body.find(e => (e.className || '') === 'sheet'); assert.ok(sh, 'Menue bleibt offen'); assert.match(sh.text(), /Keine weiteren Zonen/);
+});
+
+// ---------------------------------------------------------------- Version 5.0: Studio-Reiter und neue Einstellungen
+test('Studio-Reiter: Live, virtuelle Bruecke, Treiber – jeder Schalter sendet den richtigen Befehl', async () => {
+  const st = state(); st.global.live = { on: false, auto: true, ms: 8, lag: 8, raises: 0, under: 2, resync: 1, opts: [2, 3, 4, 6, 8, 12, 16, 24, 32, 40] };
+  st.global.vbus = { on: false, open: false, layout: 1, installed: false, daw: false, rate: 0, buf: 0, layouts: ['8 × Stereo', '5.1 + 5 × Stereo', '7.1 + 4 × Stereo'], groups: [{ first: 0, count: 6, type: 2, name: '5.1' }, { first: 6, count: 2, type: 0, name: 'Stereo 4' }], channels: ['5.1 L', '5.1 R', '5.1 C', '5.1 LFE', '5.1 Ls', '5.1 Rs', 'Stereo 4 L', 'Stereo 4 R', '', '', '', '', '', '', '', ''] };
+  st.nodes.push(nd(20, 'out', 'DCX A', { p: { excl: false, exRate: 0, pair: 0, liveDirect: true, mode: 'low', per: 2.7, lat: 5 } }));
+  const { body, ws, sent } = boot({ status: 200, ok: true, json: async () => st }); await wait(30); ws.onopen && ws.onopen(); ws.onmessage({ data: JSON.stringify(st) });
+  const nav = () => body.find(e => e.tag === 'nav').children, main = () => body.find(e => e.id === 'main'), last = op => sent.filter(m => m.op === op).pop();
+  assert.match(nav()[5].text(), /Studio/); nav()[5].fire('click'); await wait(10); const t = main().text();
+  for (const w of ['Live-Modus', 'Automatisch: so klein wie stabil', 'Aussetzer / Neu-Synchronisierungen2 / 1', 'Low-Latency · 2.7 ms', 'Virtuelle Eingänge (ASIO-Treiber, 16 Kanäle)', 'Brücke einschalten', '5.1', 'nicht installiert', 'Aufnahme-Boxen']) assert.ok(t.includes(w), 'fehlt im Studio-Reiter: ' + w);
+  const tg = l => main().find(e => e.tag === 'button' && e.attrs['aria-label'] === l), btn = l => main().find(e => e.tag === 'button' && e.text().includes(l)), sel = l => main().all(e => e.tag === 'div' && e.className === 'fl' && e.text().includes(l))[0].find(e => e.tag === 'select');
+  tg('Live-Modus').fire('click'); assert.deepEqual([last('live').on], [true]); tg('Automatisch: so klein wie stabil').fire('click'); assert.equal(last('live').auto, false);
+  let s = sel('Router-Puffer'); s.value = '16'; s.onchange(); assert.equal(last('live').ms, 16); assert.equal(s.children.length, 10);
+  tg('Brücke einschalten').fire('click'); assert.equal(last('vbus').on, true); s = sel('Surround-Zuordnung'); s.value = '2'; s.onchange(); assert.equal(last('vbus').layout, 2); assert.equal(s.children.length, 3);
+  btn('8 Eingänge').fire('click'); assert.deepEqual([last('addNode').kind, last('addNode').dev], ['vin', undefined]); btn('8 Ausgänge').fire('click'); assert.equal(last('addNode').kind, 'vout'); btn('Downmix').fire('click'); assert.deepEqual([last('addNode').kind, last('addNode').dev], ['vin', 'down']);
+  btn('Installieren').fire('click'); assert.equal(last('act').name, 'driverInstall'); assert.equal(btn('Entfernen').attrs.disabled !== undefined && btn('Entfernen').attrs.disabled !== false, true, 'Entfernen ist ohne Treiber gesperrt');
+});
+test('Aufnahme-Box: HiRes, Mehrspur, Auto-Pegel und Messwerte in den Einstellungen', async () => {
+  const st = state(); const rec = st.nodes.find(n => n.kind === 'rec'); rec.p = { fmt: 5, rate: 192000, dir: 'C:\\Aufnahmen', dither: -1, mt: 0, bp: false, pre: 5, split: 30, al: { mode: 2, target: -18, boost: 24, ceil: -1, speed: 1 } }; rec.rec = { on: false, sec: 0, bytes: 0, parts: 0, ch: 2, lufs: -17.8, tp: -1.2, gain: 6.4, gr: 0.5, clips: 0, ring: 0.03, pre: 4.8, fmt: 'WAV 32 Bit Ganzzahl · 192000 Hz' };
+  const { body, ws, sent } = boot({ status: 200, ok: true, json: async () => st }); await wait(30); ws.onopen && ws.onopen(); ws.onmessage({ data: JSON.stringify(st) });
+  const nav = () => body.find(e => e.tag === 'nav').children, last = op => sent.filter(m => m.op === op).pop(); nav()[0].fire('click'); await wait(10);
+  const mores = body.all(e => e.attrs['aria-label'] === 'Mehr'); const idx = st.nodes.findIndex(n => n.kind === 'rec'); mores[idx].fire('click'); await wait(10);
+  const sheet = () => body.find(e => e.className === 'sheet'), fl = l => sheet().all(e => e.tag === 'div' && /(^| )fl( |$)/.test(e.className) && e.children[0] && e.children[0].text().startsWith(l))[0], selv = (l, v) => { const s = fl(l).find(e => e.tag === 'select'); s.value = String(v); s.onchange() }, tgl = l => fl(l).find(e => e.tag === 'button').fire('click');
+  const tx = sheet().text(); for (const w of ['Auto-Pegel', 'Messung', '−17.8 LUFS'.replace('−', '-'), '-1.2 dBTP', '+6.4 dB', 'Pegel-Anpassung', 'Platten-Puffer', '3 %']) assert.ok(tx.includes(w), 'fehlt im Aufnahme-Fenster: ' + w);
+  const fmt = fl('Format').find(e => e.tag === 'select'); assert.equal(fmt.children.length, 6, 'sechs Formate'); assert.ok(fmt.children[5].text().includes('Ganzzahl')); const rate = fl('Samplerate').find(e => e.tag === 'select'); assert.equal(rate.children.length, 8, 'acht Samplingraten'); assert.ok(rate.children[7].text().includes('384'));
+  selv('Format', 4); assert.deepEqual([last('setProp').key, last('setProp').value], ['fmt', 4]); selv('Samplerate', 384000); assert.deepEqual([last('setProp').key, last('setProp').value], ['rate', 384000]); selv('Dither', 1); assert.deepEqual([last('setProp').key, last('setProp').value], ['dither', 1]);
+  tgl('Mehrspur'); assert.deepEqual([last('setProp').key, last('setProp').value], ['multitrack', true]); tgl('Bit-perfekt'); assert.deepEqual([last('setProp').key, last('setProp').value], ['bitperfect', true]);
+  selv('Vorlauf', 10); assert.deepEqual([last('setProp').key, last('setProp').value], ['preRoll', 10]); selv('Datei teilen nach', 60); assert.deepEqual([last('setProp').key, last('setProp').value], ['splitMin', 60]);
+  selv('Modus', 1); assert.deepEqual([last('setProp').key, last('setProp').value], ['alMode', 1]); selv('Ziel-Lautheit', -14); assert.deepEqual([last('setProp').key, last('setProp').value], ['alTarget', -14]); selv('Max. Anhebung', 12); assert.deepEqual([last('setProp').key, last('setProp').value], ['alBoost', 12]);
+  selv('Limiter-Decke', -0.5); assert.deepEqual([last('setProp').key, last('setProp').value], ['alCeil', -0.5]); selv('Reaktion', 2); assert.deepEqual([last('setProp').key, last('setProp').value], ['alSpeed', 2]);
+  sheet().find(e => e.tag === 'button' && e.text().includes('Spitzenwerte')).fire('click'); assert.equal(last('setProp').key, 'alReset');
+});
+test('Pro-Audio-Einstellungen am Geraet: Exklusiv, Rate, Kanalpaar, Live ohne Delay', async () => {
+  const st = state(); st.nodes.push(nd(21, 'cap', 'Xone:92 Eingang', { p: { excl: false, exRate: 0, pair: 1, liveDirect: true, mode: 'std', per: 10, lat: 12 } }), nd(22, 'out', 'Xone:92 Ausgang', { p: { excl: true, exRate: 96000, pair: 0, liveDirect: true, mode: 'excl', per: 2.5, lat: 4 } }));
+  const { body, ws, sent } = boot({ status: 200, ok: true, json: async () => st }); await wait(30); ws.onopen && ws.onopen(); ws.onmessage({ data: JSON.stringify(st) });
+  const nav = () => body.find(e => e.tag === 'nav').children, last = op => sent.filter(m => m.op === op).pop(); nav()[0].fire('click'); await wait(10);
+  const open = id => { const mores = body.all(e => e.attrs['aria-label'] === 'Mehr'); mores[st.nodes.findIndex(n => n.id === id)].fire('click') }; const sheet = () => body.find(e => e.className === 'sheet'), fl = l => sheet().all(e => e.tag === 'div' && /(^| )fl( |$)/.test(e.className) && e.children[0] && e.children[0].text().startsWith(l))[0];
+  open(21); await wait(10); assert.match(sheet().text(), /Pro-Audio/); assert.match(sheet().text(), /Standard · Periode 10\.0 ms/); assert.equal(fl('Kanalpaar').find(e => e.tag === 'select').children.length, 8); assert.ok(!sheet().text().includes('Live: ohne Ausgleichs-Delay'), 'nur Ausgaenge');
+  fl('Exklusiv (Windows').find(e => e.tag === 'button').fire('click'); assert.deepEqual([last('setProp').key, last('setProp').value], ['excl', true]); let s = fl('Kanalpaar').find(e => e.tag === 'select'); s.value = '3'; s.onchange(); assert.deepEqual([last('setProp').key, last('setProp').value], ['inPair', 3]);
+  s = fl('Exklusiv-Samplerate').find(e => e.tag === 'select'); assert.equal(s.children.length, 9); s.value = '192000'; s.onchange(); assert.deepEqual([last('setProp').key, last('setProp').value], ['exRate', 192000]);
+  body.find(e => e.className === 'sheet').remove(); open(22); await wait(10); assert.match(sheet().text(), /Exklusiv · Periode 2\.5 ms/); fl('Live: ohne Ausgleichs-Delay').find(e => e.tag === 'button').fire('click'); assert.deepEqual([last('setProp').key, last('setProp').value], ['liveDirect', false]);
+  assert.equal(sheet().all(e => e.tag === 'div' && /(^| )fl( |$)/.test(e.className) && e.text().includes('Kanalpaar')).length, 0, 'kein Kanalpaar am Ausgang');
+});
+test('Virtuelle Knoten im Mixer: Namen, Art, Einstellungsfenster', async () => {
+  const st = state(); st.nodes.push(nd(30, 'vin', 'DAW-Ausgang 1/2', { ports: 'out', p: { idx: 0, liveDirect: true } }), nd(31, 'vout', 'DAW-Eingang 1/2', { ports: 'in', p: { idx: 0, liveDirect: true } }));
+  const { body, ws, sent } = boot({ status: 200, ok: true, json: async () => st }); await wait(30); ws.onopen && ws.onopen(); ws.onmessage({ data: JSON.stringify(st) }); const nav = () => body.find(e => e.tag === 'nav').children, last = op => sent.filter(m => m.op === op).pop(); nav()[0].fire('click'); await wait(10);
+  const main = body.find(e => e.id === 'main'); assert.match(main.text(), /DAW → Router/); assert.match(main.text(), /Router → DAW/); for (const [id, w] of [[30, /Signal aus der DAW/], [31, /Signal zur DAW/]]) { const mores = body.all(e => e.attrs['aria-label'] === 'Mehr'); mores[st.nodes.findIndex(n => n.id === id)].fire('click'); await wait(10); assert.match(body.find(e => e.className === 'sheet').text(), w); body.find(e => e.className === 'sheet').remove(); }
+  nav()[2].fire('click'); await wait(10); nav()[1].fire('click'); await wait(10); assert.ok(body.find(e => e.id === 'main').children.length > 0, 'Matrix mit virtuellen Knoten rendert');
 });
