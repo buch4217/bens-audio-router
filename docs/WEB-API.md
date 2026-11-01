@@ -49,14 +49,16 @@ Client → Server: `{"t":"cmd","id":N,"op":…}`
 | `scene` / `sceneSave` | name | Layout laden/speichern (Name wird bereinigt) |
 | `trim` | node, ms | −500 … +500, nur Ausgänge/Sonos |
 | `delay` | node, ms | 0 … 2000; an Ausgängen nur bei ausgeschaltetem Autopilot |
-| `addNode` | kind (`cap`/`loop`/`out`/`gen`/`air`/`rec`/`sum`), dev | `dev` = Geräte-ID aus `hw` bzw. `click`/`sine`/`pink`; max. 40 Nodes |
+| `addNode` | kind (`cap`/`loop`/`out`/`gen`/`air`/`rec`/`sum`/`vin`/`vout`), dev | `dev` = Geräte-ID aus `hw` bzw. `click`/`sine`/`pink`; bei `vin`/`vout`: leer/`all` = alle 8 Stereo-Paare, `0` … `7` = ein Paar, `down` = Surround-Downmix-Quellen der Zuordnung (nur `vin`), `100` … `107` = Downmix einer Gruppe; schaltet die Brücke ein, Fehler „Schon vorhanden“, wenn nichts neu entsteht; max. 60 Nodes |
 | `removeNode` | node | |
 | `micStart` / `micStop` | rate (8000–96000) | Handy-Mikrofon als Quelle an-/abmelden |
 | `calibrate` | – | startet die Einmessung (Handy-Mikrofon muss Daten liefern) |
 | `engine` | on | Engine Start/Stopp (wie die Taste „Start“) |
-| `act` | name: `rescan` `sonosSearch` `calibrateLocal` `vdevSetup` `vdevRestore` | Aktionen wie in der Desktop-App |
+| `act` | name: `rescan` `sonosSearch` `calibrateLocal` `vdevSetup` `vdevRestore` `driverInstall` `driverRemove` | Aktionen wie in der Desktop-App; `driverInstall`/`driverRemove` laufen im Hintergrund, Windows fragt am PC nach der Administrator-Bestätigung (Ergebnis in `msg`) |
+| `live` | on, auto, ms (mindestens eines) | Live-Modus an/aus, Automatik, Router-Puffer 2 … 40 ms (ganzzahlig) |
+| `vbus` | on, layout (mindestens eines) | virtuelle Brücke an/aus; Surround-Zuordnung 0 … 6 (siehe `global.vbus.layouts`) |
 | `global` | key: `pad` `base` `poll` `drv`, value | nur Werte aus `global.opts` |
-| `setProp` | node, key, value | je Node-Art: Sonos-Stream `ip` `port` `scheme` `rate` `burst` `fmt` `volCtl` `dither` `autoLat` `vol` `play`; AirPlay `name` `port` `buf` `latAuto` `latMs` `useVol`; Aufnahme `fmt` `rate` `dir`; Test-Signal `gen`; Ausgänge `ext` |
+| `setProp` | node, key, value | **neu in 5.0:** Geräte (`out`/`cap`): `excl` (bool), `exRate` (0 oder 44100 … 384000), `inPair` (0 … 7, nur `cap`), `liveDirect` (bool, nur `out`/`vout`); `vin`/`vout`: `vbIdx`; Aufnahme-Box: `fmt` 0 … 5 (WAV 24 · FLAC 24 · FLAC 16 · WAV 16 · WAV 32 Float · WAV 32 Ganzzahl), `rate` (44100 … 384000), `dither` (−1/0/1), `multitrack`, `bitperfect` (bool, nicht gemeinsam; `multitrack` nicht mit FLAC), `preRoll` (0/2/5/10/30 s), `splitMin` (0/10/30/60/120), Auto-Pegel `alMode` (0/1/2), `alTarget` (−30 … −10), `alBoost` (0 … 36), `alCeil` (−12 … 0 in 0,5er-Schritten), `alSpeed` (0/1/2), `alReset`; während einer Aufnahme nur `al*` und `dir` · bisher: je Node-Art: Sonos-Stream `ip` `port` `scheme` `rate` `burst` `fmt` `volCtl` `dither` `autoLat` `vol` `play`; AirPlay `name` `port` `buf` `latAuto` `latMs` `useVol`; Aufnahme `fmt` `rate` `dir`; Test-Signal `gen`; Ausgänge `ext` |
 | `addStream` | ip (optional) | Sonos-Stream anlegen (Zone aus `sonosFound`) |
 | `sonosPick` / `groupAdd` | node, ip | Zone wählen / zur Gruppe hinzufügen |
 | `groupClear` / `reconnect` | node | Gruppe leeren / Node neu verbinden |
@@ -78,3 +80,11 @@ Wichtig: **Der Server vertraut dem Client nie** – alle Regeln gelten im Router
 - Optional: eigenes Zertifikat importieren (PFX/PEM), z. B. von einer echten Domain.
 - Nur TLS 1.2+, **kein HTTP-Port**.
 - Technik: Windows **SChannel** (kein Fremdcode), Zertifikate über CryptoAPI/CNG.
+
+## Neu in 5.0 (Zustand)
+
+- `global.live`: `{on, auto, ms, lag, raises, under, resync, opts}` – Live-Modus, aktueller Router-Puffer `lag` (ms), Zähler für automatische Erhöhungen, Aussetzer und Neu-Synchronisierungen.
+- `global.vbus`: `{on, open, layout, installed, daw, rate, buf, layouts:[…], groups:[{first,count,type,name}], channels:[16 Namen]}` – Brücke, Treiberstatus (`installed`), DAW verbunden (`daw`), Surround-Zuordnung mit SMPTE-Kanalnamen.
+- Node-Arten `vin` (Quelle, DAW → Router) und `vout` (Ausgang, Router → DAW) mit `p:{idx, liveDirect}` (`idx` 0 … 7 = Stereo-Paar, ab 100 = Surround-Downmix).
+- Geräte-Nodes `out`/`cap`/`loop`: `p:{excl, exRate, pair, liveDirect, mode:"excl"|"low"|"std", per (ms), lat (ms)}` – `mode` ist der **tatsächlich aktive** Modus.
+- Aufnahme-Box: `p:{fmt, rate, dither, mt, bp, pre, split, al:{mode,target,boost,ceil,speed}, dir}` und `rec:{on, sec, bytes, parts, ch, lufs, tp, gain, gr, clips, ring, pre, fmt}` (Lautheit, True Peak, Pegel-Anpassung, Limiter-Abnahme, Clips, Plattenpuffer, Vorlauf).

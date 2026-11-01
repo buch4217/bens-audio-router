@@ -160,6 +160,41 @@ Manche Eingänge sind **Mono** (zum Beispiel hat ein MiniFuse 1 nur einen Eingan
 - **Keine zusätzliche Latenz:** Das Modul wird beim Mischen direkt aufgelöst. Der Autopilot und die AirPlay-Latenzmeldung rechnen durch das Modul hindurch, als wären die Kabel direkt gezogen.
 - **Grenzen:** bis zu 6 Eingänge je Modul; Summen-Module lassen sich nicht hintereinander schalten.
 
+### Studio (ab Version 5.0): Live, HiRes-Aufnahme, Auto-Pegel, virtuelle Eingänge
+
+Alles Folgende steuerst du über die Toolbar-Taste **Studio…** (Desktop) oder den Reiter **Studio** und die Node-Einstellungen in der Web-App. Beide benutzen dieselben Befehle; alle Regeln prüft der Router.
+
+**Live-Modus (kleinste Latenz).** Für Eingänge, die du in Echtzeit hörst (z. B. DJ-Mixer: bewegst du einen Fader, soll es sofort klingen).
+- *Live-Modus einschalten*: die Geräte werden mit dem **Niedriglatenz-Pfad** neu geöffnet (Windows-10-Shared-Modus mit kleinster Geräteperiode) oder, wenn für das Gerät **Exklusiv** gewählt ist, direkt im Exklusiv-Modus. Die Engine läuft im 1-ms-Takt.
+- *Automatisch: so klein wie stabil*: der Router-Puffer startet beim gewählten Wert (2–40 ms) und wird bei Aussetzern automatisch größer, bei langer Ruhe wieder kleiner. Ohne Automatik bleibt er fest.
+- *Live: ohne Ausgleichs-Delay* (je Ausgang): lokale Ausgänge bekommen im Live-Modus nicht den Delay des Autopiloten, damit Sonos/AirPlay-Ausgleich nicht die Live-Latenz zerstört. Sonos- und AirPlay-Ausgänge verhalten sich wie bisher.
+- Im Fenster siehst du je Ausgang, welcher Modus wirklich aktiv ist (**Exklusiv**, **Low-Latency** oder **Standard**), die Geräteperiode und eine grobe Eingang→Ausgang-Latenz. **Steht „Standard“, hat das Gerät keinen Niedriglatenz-Pfad** – dann hilft Exklusiv oder ein ASIO-Treiber des Herstellers nicht, aber der Router-Anteil ist trotzdem minimal.
+- Die erreichbare Gesamtlatenz hängt vom Gerätetreiber ab (USB-Class-Geräte im Exklusiv-Modus erreichen oft wenige Millisekunden).
+
+**Exklusiv (Pro-Audio) je Gerät.** Auswahl eines Eingangs oder Ausgangs im Graph, dann *Exklusiv*: das Gerät gehört dem Router, der Windows-Mixer wird umgangen, die Wiedergabe ist bit-genau. Der Router wählt selbst ein passendes Format (32/24/16 Bit, deine *Exklusiv-Samplerate* oder die des Geräts). Klappt es nicht (Gerät belegt, in Windows nicht erlaubt), meldet der Router den Grund und fällt auf den normalen Modus zurück. Bei Mehrkanal-Eingängen wählst du das **Kanalpaar** (1/2 … 15/16).
+
+**Aufnahme-Box: HiRes.** Format: WAV 24 Bit, **WAV 32 Bit Ganzzahl**, WAV 32 Bit Float, WAV 16 Bit (mit Dither), FLAC 24/16 Bit. Samplerate **44,1 bis 384 kHz**. Die Wandlung ist **bit-genau**: kommt eine 24-Bit-Quelle ohne Gain an, steht jedes Sample unverändert in der Datei.
+- *Bit-perfekt*: genau **eine** Quelle (kein Summen-Modul), die Datei folgt dem Takt der Quelle, **kein** Resampling, Gain, Limiter oder Dither. Die Samplerate der Datei ist die der Quelle.
+- *Mehrspur*: jedes Kabel in die Box ist ein **Stereo-Paar** (Kanal 1/2, 3/4, … bis 16 Kanäle), in der Reihenfolge, in der du die Kabel gelegt hast. Eine einzige WAV (RF64 über 4 GB) mit Kanalmaske, nur WAV. Gain der Box wirkt auf alle Spuren; Auto-Pegel ist im Mehrspur-Modus nur Messung.
+- *Vorlauf (Pre-Record)*: 2–30 s – drückst du ● REC, sind die Sekunden **davor** schon in der Datei.
+- *Datei teilen nach*: 10–120 min, lückenlos (auch FLAC); die Teile heißen `…_002`, `…_003`. Standard ist „nie“: eine Datei.
+- Die Dateien tragen einen **BWF-Zeitstempel** (`bext`), den DAWs zur Platzierung nutzen. Der Schreib-Thread hat einen Ringpuffer für mindestens 8 s Daten (bei 16 Kanälen/192 kHz entsprechend mehr).
+
+**Auto-Pegel.** Damit die Aufnahme **nicht zu leise und nicht übersteuert** ist:
+- *Nur Limiter (Schutz)*: schützt vor Übersteuern, ändert aber die Dynamik nicht. Die Decke (−12 … 0 dBTP, Standard −1) gilt als **True Peak**.
+- *Pegeln + Limiter*: zusätzlich passt der Leveler die Lautstärke langsam an die **Ziel-Lautheit** an (−30 … −10 LUFS, Standard −18) – leise Aufnahmen werden angehoben (höchstens um *Max. Anhebung*), laute abgesenkt. Pausen und Rauschen unter ca. −55 LUFS werden nicht aufgepumpt. *Reaktion*: langsam/normal/schnell.
+- Der Auto-Pegel hat ≈ 2 ms Vorlauf (Look-ahead). Im **Bit-perfekt-Modus** läuft er nicht (nur Messung). Alle Messwerte (Lautheit, True Peak, Pegel, Limiter-Abnahme, Clips) siehst du laufend.
+- Grenze: bei **Vollband-Weißrauschen** kann der True Peak die Decke um bis zu etwa 0,7 dB überschreiten; bei Musiksignalen hält er sie ein. Die Abtastwerte selbst überschreiten die Decke nie.
+
+**Virtuelle Eingänge (ASIO-Treiber „Bens Virtual Bus“).** 16 Kanäle = **8 Stereo-Eingänge aus der DAW** und **8 Stereo-Ausgänge zur DAW**:
+1. *Studio → Treiber installieren…* (einmalig, die EXE bittet Windows um die Administrator-Bestätigung; danach läuft der Router wie gewohnt ohne Admin).
+2. *Brücke einschalten* und *8 virtuelle Eingänge* bzw. *8 virtuelle Ausgänge* anlegen. Es erscheinen Quellen „DAW-Ausgang 1/2 …“ (zum Weiterverkabeln, z. B. in die Aufnahme-Box oder einen Ausgang) und Ausgänge „DAW-Eingang 1/2 …“ (was die DAW aufnehmen kann).
+3. In der DAW (Ableton, Reaper, Cubase …) den ASIO-Treiber **„Bens Virtual Bus“** wählen; der Router muss laufen und die Brücke an sein. Samplerate und Puffer (32–2048) bestimmt die DAW (44,1 … 384 kHz).
+- *Surround-Zuordnung*: legt fest, wie die 16 Kanäle benannt und gruppiert sind (SMPTE-Reihenfolge): 8 × Stereo · 5.1 + 5 × Stereo · 7.1 + 4 × Stereo · 5.1 × 2 + 2 × Stereo · 7.1 × 2 · Quad × 4 · 7.1.4 (Atmos-Bett) + 2 × Stereo. Die DAW zeigt die Namen („5.1 C“, „7.1.4 Ltf“ …).
+- *Surround-Downmix*: legt für jede Surround-Gruppe der gewählten Zuordnung eine Stereo-Quelle an (ITU-R BS.775, −3 dB gesamt, LFE nicht im Downmix) – so kannst du eine Surround-Produktion im Stereo-Graph abhören oder aufnehmen. Die einzelnen Paare bleiben als normale virtuelle Eingänge verfügbar.
+- Nur DAWs mit **ASIO** sehen den Treiber. Als Windows-Soundgerät (WASAPI) erscheint er **nicht** – das würde einen signierten Kernel-Treiber brauchen.
+- Der Treiber ist reiner User-Mode-Code in einer DLL, die in der EXE steckt (`%ProgramData%\BensAudioRouter\BensAsioBridge.dll`). *Treiber entfernen…* nimmt ihn wieder heraus. Läuft gerade eine DAW damit, verschwindet die Datei nach dem Schließen bzw. beim nächsten Windows-Start.
+
 ### Hintergrund-Betrieb (Tray-Symbol und Autostart)
 Der Router läuft auf Wunsch **unsichtbar im Hintergrund** und stellt sich in der Taskleiste als **Symbol im Infobereich (Tray)** dar. Linksklick öffnet das Fenster, Rechtsklick zeigt das Menü (gleiches Menü: Toolbar → **Hintergrund…**):
 - **Mit Windows starten (im Hintergrund):** startet beim Anmelden automatisch; schaltet zugleich „Engine automatisch starten“ und „Schließen = Tray“ ein.
@@ -404,6 +439,15 @@ Der aktuelle Zustand wird **automatisch** gespeichert (`graph.txt`) und beim nä
 Toolbar-Einstellungen im Überblick: **Ausgabe-Puffer** (Füllstand je Ausgang), **Safety-Puffer** (Reserve zwischen Quelle und Ausgabe), **Poll-Takt**
 (Verarbeitungs-Intervall), **Treiber-Puffer** (WASAPI-Puffer; wirkt beim nächsten Öffnen).
 
+### Studio-Funktionen
+- **Live-Modus: Ausgang zeigt „Standard“** → das Gerät hat keinen Niedriglatenz-Pfad. *Exklusiv* am Gerät einschalten oder in „Studio…“ prüfen, ob das Gerät belegt ist.
+- **„Exklusiv: Das Gerät wird gerade von einem anderen Programm benutzt“** → anderes Programm beenden; bei „nicht erlaubt“ in Windows (Sound → Geräteeigenschaften → Erweitert) „Anwendungen haben Exklusiv-Kontrolle“ erlauben.
+- **Im Live-Modus knackt es / Aussetzer-Zähler steigt** → „Automatisch“ einschalten oder den Router-Puffer größer wählen; Poll-Takt 1 ms.
+- **Aufnahme: „Bit-perfekt: genau EINE laufende Quelle verbinden“** → Summen-Modul entfernen, nur eine Quelle in die Box kabeln.
+- **FLAC lässt sich nicht mit Mehrspur kombinieren** → FLAC kennt hier nur Stereo; für Mehrspur WAV wählen.
+- **ASIO-Treiber fehlt in der DAW** → in „Studio…“ prüfen, ob „installiert“ steht; DAW neu starten; die DAW muss 64 Bit sein. **„Treiber installieren“ schlägt fehl** → läuft noch eine DAW mit dem Treiber? Schließen und erneut versuchen.
+- **DAW verbunden, aber keine Pegel** → „Brücke einschalten“, Engine starten, virtuelle Eingänge/Ausgänge anlegen und verkabeln.
+
 ## 13. Technische Hintergründe
 
 - **Zeitachse:** Jede Quelle schreibt in einen Ringpuffer (14 s). Jeder Ausgang liest je Verbindung mit eigenem Zeiger exakt *Lag* Frames dahinter.
@@ -415,6 +459,8 @@ Toolbar-Einstellungen im Überblick: **Ausgabe-Puffer** (Füllstand je Ausgang),
 - **AirPlay-Empfänger:** eigener mDNS-Responder, RTSP-Server (Apple-Challenge per RSA-2048, ANNOUNCE mit RSA-OAEP/AES-128-CBC), RTP-Audio mit Resend, ALAC-Decoder (MIT, D. Hammerton), eigene Krypto ohne Fremdbibliotheken (gegen Python/OpenSSL verifiziert).
 - **Sonos:** SSDP-Suche, UPnP/SOAP (AVTransport, RenderingControl), HTTP/1.0-Stream ohne Chunking, Chunked-Antworten werden dekodiert, Gruppen über `x-rincon:`.
 - **Entwickleroptionen:** Startparameter `/start` (Engine automatisch starten); Testschalter für Selbsttests sind im Quelltext dokumentiert.
+
+**Studio (5.0).** Auto-Pegel: K-Bewertung und Lautheit nach ITU-R BS.1770 (gemessen: 997 Hz, −20 dBFS → −20,00 LUFS), Limiter mit Gleitminimum + Gleitmittel über 1,5 ms und 8×/4×/2×-True-Peak-Erkennung (32-Tap-Kaiser-Sinc). Rekorder: bit-genaue Wandlung (Faktor 2²³ bzw. 2³¹), RF64, `bext`. Virtuelle Brücke: gemeinsamer Speicher `Local\BensVBus1`, zwei lock-freie Ringe (65536 Frames × 16 Kanäle), Takt über die Systemuhr (QPC) auf beiden Seiten, deshalb kein Auseinanderdriften. Live-Latenz: Regler hebt den Puffer bei Aussetzern an und senkt ihn bei Ruhe (45 s) wieder ab.
 
 ## 14. Grenzen, AirPlay 2 und Roadmap
 

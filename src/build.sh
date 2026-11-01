@@ -4,6 +4,8 @@
 set -e
 cd "$(dirname "$0")"
 python3 ../tools/gen_web_assets.py 2>/dev/null || true
+# ASIO-Treiber (eigenstaendige DLL) bauen und in die EXE einbetten (Ressource 101)
+x86_64-w64-mingw32-g++-posix -std=c++17 -O2 -shared -static -static-libgcc -static-libstdc++ ../driver/bensasio.cpp -o bensasio.dll -lole32 -loleaut32 -luuid -ladvapi32 -lwinmm -lavrt
 x86_64-w64-mingw32-windres app.rc -O coff -o app.res.o
 x86_64-w64-mingw32-gcc -O2 -c alac.c -o alac.o -w
 x86_64-w64-mingw32-g++-posix -std=c++17 -O3 -ffast-math -Wall -Wextra -municode -mwindows -static -static-libgcc -static-libstdc++ \

@@ -40,6 +40,10 @@
 #include "stream.h"
 #include "airplay.h"
 #include "wavrec.h"
+#include "dyn.h"
+#include "vbus.h"
+#include "vbus_win.h"
+#include "livectl.h"
 #include "route.h"
 #include "qr.h"
 #include "webwin.h"
@@ -56,7 +60,7 @@
 // ======================================================================= Basis
 
 #define APP_NAME      L"Bens Audio Router"
-#define APP_VERSION   L"4.5"
+#define APP_VERSION   L"5.0"
 #define APP_PUBLISHER L"Buccloud Software (DE)"
 #define APP_COPYRIGHT L"© Ben Buchholz · www.buccloud.de · 2026"
 #define APP_URL       L"https://www.buccloud.de"
@@ -117,10 +121,10 @@ static std::wstring LayoutDir() {
 
 // ======================================================================= Datenmodell
 
-enum Kind { K_LOOP = 0, K_CAPTURE = 1, K_GEN = 2, K_OUT = 3, K_STREAM = 4, K_AIRPLAY = 5, K_REC = 6, K_SUM = 7 };
+enum Kind { K_LOOP = 0, K_CAPTURE = 1, K_GEN = 2, K_OUT = 3, K_STREAM = 4, K_AIRPLAY = 5, K_REC = 6, K_SUM = 7, K_VIN = 8, K_VOUT = 9 };   // K_VIN/K_VOUT: virtuelle Eingaenge/Ausgaenge der Bruecke (ASIO-Treiber)
 enum GenType { G_CLICK = 0, G_SINE = 1, G_PINK = 2, G_SIMMIC = 3 };
 static const size_t TS_CAP = 16384;
-static inline bool IsSink(int k) { return k == K_OUT || k == K_STREAM || k == K_REC; }
+static inline bool IsSink(int k) { return k == K_OUT || k == K_STREAM || k == K_REC || k == K_VOUT; }
 static inline bool IsOutSink(int k) { return k == K_OUT || k == K_STREAM; }   // Ausgaenge mit Latenz (Autopilot, Einmessung); die Aufnahme-Box zaehlt nicht
 
 struct DevInfo {
@@ -130,9 +134,22 @@ struct DevInfo {
 // Aufnahme-Box: Senke, die das gemischte Signal als WAV-Datei aufzeichnet (Einstellungen + Rekorder)
 struct RecCtx {
     wavrec::Recorder rec;
-    int bits = 24;                 // WAV: 16, 24 oder 32 (Float); FLAC: 16 oder 24
+    int bits = 24;                 // WAV: 16, 24 oder 32 (Float bzw. Ganzzahl); FLAC: 16 oder 24
     bool flac = false;             // true = FLAC (verlustfrei) statt WAV
-    int rate = 48000;              // 44100, 48000, 88200, 96000
+    bool int32 = false;            // bei 32 Bit: Ganzzahl-PCM statt Float
+    int rate = 48000;              // 44100 ... 384000 (HiRes)
+    int dither = -1;               // -1 automatisch (16 Bit an), 0 aus, 1 TPDF
+    int multitrack = 0;            // 0 = Stereo-Mix aller Quellen, 1 = Mehrspur: jedes Kabel = ein Stereo-Paar (bis 16 Kanaele)
+    bool bitperfect = false;       // genau eine Quelle, Quelltakt, keine Verarbeitung (Gain/Auto-Pegel aus)
+    double preRoll = 0;            // Sekunden Vorlauf (Pre-Record)
+    double splitMin = 0;           // Minuten je Datei (0 = eine Datei)
+    dyn::AutoLevel al;             // Auto-Pegel (Messung laeuft immer, Regelung je nach Modus)
+    dyn::Params alp;               // Einstellung des Auto-Pegels (Modus 0 aus / 1 Limiter / 2 Pegeln + Limiter)
+    int alRate = 0;                // Rate, mit der 'al' initialisiert wurde
+    uint64_t bpPos = 0; bool bpSync = false; int bpRate = 0;   // Bit-perfekt: Leseposition im Quellpuffer
+    std::vector<float> mtTmp, mtOut;   // Mehrspur-Zwischenpuffer
+    int curCh = 2;                 // Kanalzahl der laufenden/bereiten Aufnahme
+    int64_t armSig = 0; int bpGen = -1;   // Vorlauf-Konfiguration / Bit-perfekt: Generation der Quelle
     std::wstring dir;              // Zielordner
     std::wstring err;              // letzte Fehlermeldung (Anzeige)
     double t0 = 0;
@@ -196,6 +213,15 @@ struct Node {
     StreamCtx* st = nullptr;
     AirplayCtx* ap = nullptr;
     RecCtx* rc = nullptr;
+    std::atomic<bool> liveDirect{true};   // Live-Modus: dieser Ausgang bekommt keinen Ausgleichs-Delay (Autopilot), nur die kleine Live-Latenz
+    std::atomic<bool> excl{false};        // WASAPI-Exklusiv (Pro-Audio): Geraet direkt, kleinste Latenz, HiRes bit-genau
+    int exRate = 0;                       // Exklusiv: gewuenschte Samplerate (0 = Standard des Geraets)
+    std::atomic<int> inPair{0};           // Mehrkanal-Eingang: welches Stereo-Paar (0 = Kanal 1/2)
+    bool lowLat = false, exclActive = false;   // tatsaechlich aktiver Modus (Anzeige)
+    double devPeriodMs = 0;               // Periode des Geraets (Anzeige)
+    int outCh = 2, outBits = 32, outValid = 32; bool outFloat = true;   // Ausgabeformat des Geraets (Exklusiv: Geraeteformat, sonst Float-Stereo)
+    int vbIdx = 0;                        // K_VIN/K_VOUT: 0..7 = Stereo-Paar, 100+g = Surround-Downmix der Gruppe g
+    double vbLast = 0;                    // K_VIN: letzte Daten (Uhr) fuer Stille-Fuellung
     bool remote = false;                // Handy-Mikrofon: Quelle ohne Geraet, gespeist ueber das Web-Interface
     int remRate = 48000; uint64_t remNext = 0; double remOff = 1e18, remLast = 0;
     std::atomic<bool> sumMono{false};   // Summen-Modul: Mono-Summe am Ausgang
@@ -235,7 +261,20 @@ static std::vector<Conn*> g_conns;
 static std::atomic<bool> g_running{false};
 static HANDLE g_thread = nullptr;
 static std::atomic<int> g_pollMs{2}, g_padMs{20}, g_baseMs{30}, g_drvMs{100};
-static std::atomic<uint32_t> g_underruns{0};
+static std::atomic<uint32_t> g_underruns{0}, g_resyncs{0};
+// Live-Modus: kleinste stabile Latenz fuer Eingaenge -> Ausgaenge (adaptiv)
+static std::atomic<bool> g_live{false};
+static LiveCtl g_liveCtl;
+static std::atomic<int> g_liveStartMs{8};
+// Virtuelle Bruecke (ASIO-Treiber <-> Router)
+static HANDLE g_vbMap = nullptr;
+static vbus::Header* g_vb = nullptr;
+static std::atomic<bool> g_vbWanted{false};
+static std::atomic<int> g_vbLayout{0};
+static vbus::Reader g_vbRd;
+static uint32_t g_vbEpoch = 0; static int g_vbRate = 48000; static bool g_vbDrvOn = false;
+static double g_vbOutT0 = 0; static uint64_t g_vbOutDone = 0;
+static std::vector<float> g_vbIn16, g_vbTmp, g_vbOut16;
 static std::atomic<float> g_loopUs{0};
 static int g_nextId = 1;
 static bool g_autoSync = true;   // Autopilot standardmaessig an
@@ -288,6 +327,94 @@ static float ReadSample(const BYTE* base, int bits, bool isFloat, size_t idx) {
 }
 
 static const double RING_SECONDS = 14.0;
+static bool OpenVIn(Node* n);
+static bool OpenVOut(Node* n);
+
+// ---- WASAPI-Exklusiv (Pro-Audio) und Low-Latency-Shared (IAudioClient3)
+static const GUID BAR_SUB_PCM = {0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+static const GUID BAR_SUB_FLT = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+struct XFmt { WAVEFORMATEXTENSIBLE wf; int rate = 0, cont = 0, valid = 0, ch = 0; bool flt = false; };
+// Sucht ein vom Geraet im Exklusiv-Modus unterstuetztes Format (Wunschrate zuerst, dann Standard des Geraets, dann gaengige HiRes-Raten)
+static bool NegotiateExclusive(IAudioClient* cl, int wantRate, int mixRate, int mixCh, XFmt& o) {
+    std::vector<int> rates;
+    auto addR = [&](int r) { if (r > 0 && std::find(rates.begin(), rates.end(), r) == rates.end()) rates.push_back(r); };
+    addR(wantRate); addR(mixRate);
+    for (int r : {48000, 44100, 96000, 88200, 192000, 176400, 384000, 352800}) addR(r);
+    std::vector<int> chans = {2}; if (mixCh > 2 && mixCh <= 32) chans.push_back(mixCh);
+    struct F { int cont, valid; bool flt; };
+    const F fm[] = {{32, 24, false}, {32, 32, false}, {24, 24, false}, {32, 32, true}, {16, 16, false}};
+    for (int r : rates) for (int ch : chans) for (const F& f : fm) {
+        XFmt x; memset(&x.wf, 0, sizeof x.wf); WAVEFORMATEXTENSIBLE& w = x.wf;
+        w.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE; w.Format.nChannels = (WORD)ch; w.Format.nSamplesPerSec = (DWORD)r; w.Format.wBitsPerSample = (WORD)f.cont;
+        w.Format.nBlockAlign = (WORD)(ch * f.cont / 8); w.Format.nAvgBytesPerSec = (DWORD)r * w.Format.nBlockAlign; w.Format.cbSize = 22;
+        w.Samples.wValidBitsPerSample = (WORD)f.valid; w.dwChannelMask = ch == 2 ? 3u : ch == 1 ? 4u : ((1u << ch) - 1); w.SubFormat = f.flt ? BAR_SUB_FLT : BAR_SUB_PCM;
+        if (cl->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, (WAVEFORMATEX*)&w, nullptr) == S_OK) { x.rate = r; x.cont = f.cont; x.valid = f.valid; x.ch = ch; x.flt = f.flt; o = x; return true; }
+    }
+    return false;
+}
+// Initialisiert 'cl' im Exklusiv-Modus (bei "Puffergroesse nicht ausgerichtet" mit neu aktiviertem Client wiederholen)
+static HRESULT InitExclusive(IMMDevice* dev, Com<IAudioClient>& cl, const XFmt& x, REFERENCE_TIME dur) {
+    HRESULT hr = cl->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, dur, 0, (const WAVEFORMATEX*)&x.wf, nullptr);
+    if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+        UINT32 bf = 0; cl->GetBufferSize(&bf);
+        dur = (REFERENCE_TIME)(10000000.0 * bf / x.rate + 0.5);
+        Com<IAudioClient> c2;
+        if (FAILED(dev->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&c2))) return hr;
+        hr = c2->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, dur, 0, (const WAVEFORMATEX*)&x.wf, nullptr);
+        if (SUCCEEDED(hr)) { IAudioClient* old = cl.p; cl.p = c2.p; c2.p = old; }   // c2 raeumt den alten Client auf
+    }
+    return hr;
+}
+static std::wstring ExclErr(HRESULT hr) {
+    if (hr == AUDCLNT_E_DEVICE_IN_USE) return L"Exklusiv: Das Gerät wird gerade von einem anderen Programm benutzt";
+    if (hr == AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED) return L"Exklusiv: In Windows für dieses Gerät nicht erlaubt (Soundeinstellungen → Gerät → Erweitert)";
+    return HrMsg(L"Exklusiv-Start fehlgeschlagen", hr);
+}
+// Exklusiv-Zugriff auf ein Geraet. Setzt Client, Dienst und Formatfelder des Nodes.
+static bool OpenExclusive(Node* n, IMMDevice* dev, bool capture, int mixRate, int mixCh) {
+    Com<IAudioClient> cl;
+    HRESULT hr = dev->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&cl);
+    if (FAILED(hr)) { SetErr(n, HrMsg(L"Gerät nicht zu öffnen", hr)); return false; }
+    XFmt x;
+    if (!NegotiateExclusive(cl, n->exRate, mixRate, mixCh, x)) { SetErr(n, L"Exklusiv: kein passendes Format (Gerät belegt oder Exklusiv nicht erlaubt?)"); return false; }
+    REFERENCE_TIME defP = 0, minP = 0; cl->GetDevicePeriod(&defP, &minP);
+    REFERENCE_TIME per = std::max<REFERENCE_TIME>(minP, g_live.load() ? 25000 : 50000);   // 2,5 ms Live, sonst 5 ms
+    hr = InitExclusive(dev, cl, x, per * 2);
+    if (FAILED(hr)) { SetErr(n, ExclErr(hr)); return false; }
+    UINT32 bf = 0; cl->GetBufferSize(&bf);
+    if (capture) {
+        Com<IAudioCaptureClient> cap; hr = cl->GetService(IID_IAudioCaptureClient, (void**)&cap);
+        if (FAILED(hr)) { SetErr(n, HrMsg(L"Capture-Dienst fehlt", hr)); return false; }
+        n->ch = x.ch; n->bits = x.cont; n->isFloat = x.flt; n->rate = x.rate; n->sb.init(n->rate, RING_SECONDS);
+        hr = cl->Start(); if (FAILED(hr)) { SetErr(n, HrMsg(L"Start fehlgeschlagen", hr)); return false; }
+        n->cap = cap.p; cap.p = nullptr; n->lastPacket = n->lastFill = NowSec();
+    } else {
+        Com<IAudioRenderClient> ren; hr = cl->GetService(IID_IAudioRenderClient, (void**)&ren);
+        if (FAILED(hr)) { SetErr(n, HrMsg(L"Render-Dienst fehlt", hr)); return false; }
+        n->outCh = x.ch; n->outBits = x.cont; n->outValid = x.valid; n->outFloat = x.flt; n->rate = x.rate;
+        UINT32 pre = std::min<UINT32>(bf, (UINT32)(x.rate / 200)); BYTE* o = nullptr;
+        if (SUCCEEDED(ren->GetBuffer(pre, &o))) ren->ReleaseBuffer(pre, AUDCLNT_BUFFERFLAGS_SILENT);
+        hr = cl->Start(); if (FAILED(hr)) { SetErr(n, HrMsg(L"Start fehlgeschlagen", hr)); return false; }
+        n->ren = ren.p; ren.p = nullptr; n->bufFrames = bf;
+    }
+    n->client = cl.p; cl.p = nullptr; n->exclActive = true; n->lowLat = false; n->devPeriodMs = (double)per / 10000.0;
+    REFERENCE_TIME lat = 0; if (n->client->GetStreamLatency(&lat) == S_OK) n->streamLatMs = (double)lat / 10000.0;
+    n->state = 1; n->openGen++;
+    Log("%s exklusiv geöffnet: %s (%d Hz, %d Kanäle, %d Bit%s, Periode %.1f ms)", capture ? "Eingang" : "Ausgang", U8(n->name).c_str(), x.rate, x.ch, x.valid, x.flt ? " float" : "", n->devPeriodMs);
+    return true;
+}
+// Live: kleinste Engine-Periode im Shared-Modus (IAudioClient3, Windows 10+). true = initialisiert, periodMs gesetzt.
+static bool InitLowLatency(IAudioClient* cl, const WAVEFORMATEX* fmt, double& periodMs) {
+    IAudioClient3* c3 = nullptr;
+    if (FAILED(cl->QueryInterface(__uuidof(IAudioClient3), (void**)&c3)) || !c3) return false;
+    UINT32 def = 0, fund = 0, mn = 0, mx = 0; bool ok = false;
+    if (SUCCEEDED(c3->GetSharedModeEnginePeriod(fmt, &def, &fund, &mn, &mx)) && mn > 0 && fmt->nSamplesPerSec > 0) {
+        ok = SUCCEEDED(c3->InitializeSharedAudioStream(0, mn, fmt, nullptr));
+        if (ok) periodMs = 1000.0 * (double)mn / (double)fmt->nSamplesPerSec;
+    }
+    c3->Release();
+    return ok;
+}
 
 static bool OpenSource(Node* n) {
     if (n->remote) { n->rate = n->remRate; n->ch = 1; n->sb.init(n->rate, RING_SECONDS); n->tsN = 0; n->remNext = 0; n->remOff = 1e18; n->state = 1; n->openGen++; Log("Handy-Mikrofon bereit (%d Hz)", n->rate); return true; }
@@ -312,6 +439,8 @@ static bool OpenSource(Node* n) {
         n->openGen++;
         return true;
     }
+    if (n->kind == K_VIN) return OpenVIn(n);
+    n->exclActive = false; n->lowLat = false; n->devPeriodMs = 0;
     Com<IMMDevice> dev;
     HRESULT hr = g_enumA->GetDevice(n->devId.c_str(), &dev);
     if (FAILED(hr)) { SetErr(n, L"Gerät nicht gefunden"); return false; }
@@ -327,8 +456,29 @@ static bool OpenSource(Node* n) {
     n->isFloat = (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
     if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
         n->isFloat = (((const WAVEFORMATEXTENSIBLE*)fmt)->SubFormat.Data1 == WAVE_FORMAT_IEEE_FLOAT);
+    if (n->excl.load() && n->kind == K_CAPTURE) {   // Pro-Audio: Exklusiv (bei Fehler zurueck in den normalen Modus)
+        int mr = n->rate, mc = n->ch; CoTaskMemFree(fmt); fmt = nullptr;
+        if (OpenExclusive(n, dev, true, mr, mc)) return true;
+        Log("Exklusiv für %s nicht möglich (%s) – normaler Modus", U8(n->name).c_str(), U8(n->err).c_str());
+        cl.p->Release(); cl.p = nullptr; n->err[0] = 0;
+        hr = dev->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&cl);
+        if (FAILED(hr)) { SetErr(n, HrMsg(L"Gerät nicht zu öffnen", hr)); return false; }
+        hr = cl->GetMixFormat(&fmt);
+        if (FAILED(hr) || !fmt) { SetErr(n, HrMsg(L"Format nicht lesbar", hr)); return false; }
+        n->ch = fmt->nChannels; n->rate = (int)fmt->nSamplesPerSec; n->bits = fmt->wBitsPerSample; n->isFloat = (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+        if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE) n->isFloat = (((const WAVEFORMATEXTENSIBLE*)fmt)->SubFormat.Data1 == WAVE_FORMAT_IEEE_FLOAT);
+    }
     DWORD flags = (n->kind == K_LOOP) ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0;
-    hr = cl->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2000000, 0, fmt, nullptr);
+    double perMs = 0; bool low = false;
+    if (g_live.load() && n->kind == K_CAPTURE) low = InitLowLatency(cl, fmt, perMs);
+    if (!low) {
+        if (g_live.load() && n->kind == K_CAPTURE) {   // Client nach dem Fehlversuch frisch holen
+            cl.p->Release(); cl.p = nullptr;
+            if (FAILED(dev->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&cl))) { CoTaskMemFree(fmt); SetErr(n, L"Gerät nicht zu öffnen"); return false; }
+        }
+        hr = cl->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2000000, 0, fmt, nullptr);
+        REFERENCE_TIME dP = 0, mP = 0; if (SUCCEEDED(cl->GetDevicePeriod(&dP, &mP))) perMs = (double)dP / 10000.0;
+    } else hr = S_OK;
     CoTaskMemFree(fmt);
     if (FAILED(hr)) { SetErr(n, HrMsg(L"Quelle nicht initialisierbar", hr)); return false; }
     Com<IAudioCaptureClient> cap;
@@ -339,14 +489,18 @@ static bool OpenSource(Node* n) {
     if (FAILED(hr)) { SetErr(n, HrMsg(L"Start fehlgeschlagen", hr)); return false; }
     n->client = cl.p; cl.p = nullptr;
     n->cap = cap.p; cap.p = nullptr;
+    n->lowLat = low; n->devPeriodMs = perMs;
+    REFERENCE_TIME lat = 0; if (n->client->GetStreamLatency(&lat) == S_OK) n->streamLatMs = (double)lat / 10000.0;
     n->lastPacket = n->lastFill = NowSec();
     n->state = 1;
     n->openGen++;
-    Log("Quelle geöffnet: %s (%d Hz, %d Kanäle, %d Bit%s)", U8(n->name).c_str(), n->rate, n->ch, n->bits, n->isFloat ? " float" : "");
+    Log("Quelle geöffnet: %s (%d Hz, %d Kanäle, %d Bit%s%s, Periode %.1f ms)", U8(n->name).c_str(), n->rate, n->ch, n->bits, n->isFloat ? " float" : "", low ? ", Low-Latency" : "", perMs);
     return true;
 }
 
 static bool OpenOutput(Node* n) {
+    if (n->kind == K_VOUT) return OpenVOut(n);
+    n->exclActive = false; n->lowLat = false; n->devPeriodMs = 0; n->outCh = 2; n->outBits = 32; n->outValid = 32; n->outFloat = true;
     Com<IMMDevice> dev;
     HRESULT hr = g_enumA->GetDevice(n->devId.c_str(), &dev);
     if (FAILED(hr)) { SetErr(n, L"Gerät nicht gefunden"); return false; }
@@ -356,19 +510,42 @@ static bool OpenOutput(Node* n) {
     WAVEFORMATEX* mf = nullptr;
     hr = cl->GetMixFormat(&mf);
     if (FAILED(hr) || !mf) { SetErr(n, HrMsg(L"Format nicht lesbar", hr)); return false; }
-    int rate = (int)mf->nSamplesPerSec;
+    int rate = (int)mf->nSamplesPerSec, mixCh = mf->nChannels;
+    bool mixFloatStereo = mf->nChannels == 2 && (mf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT || (mf->wFormatTag == WAVE_FORMAT_EXTENSIBLE && ((const WAVEFORMATEXTENSIBLE*)mf)->SubFormat.Data1 == WAVE_FORMAT_IEEE_FLOAT));
+    if (n->excl.load()) {   // Pro-Audio: Exklusiv (bei Fehler zurueck in den normalen Modus)
+        CoTaskMemFree(mf); mf = nullptr;
+        if (OpenExclusive(n, dev, false, rate, mixCh)) return true;
+        Log("Exklusiv für %s nicht möglich (%s) – normaler Modus", U8(n->name).c_str(), U8(n->err).c_str());
+        cl.p->Release(); cl.p = nullptr; n->err[0] = 0; n->exclActive = false;
+        hr = dev->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&cl);
+        if (FAILED(hr)) { SetErr(n, HrMsg(L"Gerät nicht zu öffnen", hr)); return false; }
+        hr = cl->GetMixFormat(&mf);
+        if (FAILED(hr) || !mf) { SetErr(n, HrMsg(L"Format nicht lesbar", hr)); return false; }
+        rate = (int)mf->nSamplesPerSec;
+    }
+    double perMs = 0; bool low = false;
+    if (g_live.load() && mixFloatStereo) {
+        low = InitLowLatency(cl, mf, perMs);
+        if (!low) {   // Client nach dem Fehlversuch frisch holen
+            cl.p->Release(); cl.p = nullptr;
+            if (FAILED(dev->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&cl))) { CoTaskMemFree(mf); SetErr(n, L"Gerät nicht zu öffnen"); return false; }
+        }
+    }
     CoTaskMemFree(mf);
-    WAVEFORMATEX rf = {};
-    rf.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
-    rf.nChannels = 2;
-    rf.nSamplesPerSec = rate;
-    rf.wBitsPerSample = 32;
-    rf.nBlockAlign = 8;
-    rf.nAvgBytesPerSec = rate * 8;
-    REFERENCE_TIME dur = (REFERENCE_TIME)g_drvMs.load() * 10000;
-    hr = cl->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, dur, 0, &rf, nullptr);
-    if (FAILED(hr)) { SetErr(n, HrMsg(L"Ausgang nicht initialisierbar", hr)); return false; }
+    if (!low) {
+        WAVEFORMATEX rf = {};
+        rf.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        rf.nChannels = 2;
+        rf.nSamplesPerSec = rate;
+        rf.wBitsPerSample = 32;
+        rf.nBlockAlign = 8;
+        rf.nAvgBytesPerSec = rate * 8;
+        REFERENCE_TIME dur = (REFERENCE_TIME)(g_live.load() ? 30 : g_drvMs.load()) * 10000;
+        hr = cl->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, dur, 0, &rf, nullptr);
+        REFERENCE_TIME dP = 0, mP = 0; if (SUCCEEDED(cl->GetDevicePeriod(&dP, &mP))) perMs = (double)dP / 10000.0;
+        if (FAILED(hr)) { SetErr(n, HrMsg(L"Ausgang nicht initialisierbar", hr)); return false; }
+    }
     UINT32 bf = 0;
     cl->GetBufferSize(&bf);
     Com<IAudioRenderClient> ren;
@@ -376,18 +553,19 @@ static bool OpenOutput(Node* n) {
     if (FAILED(hr)) { SetErr(n, HrMsg(L"Render-Dienst fehlt", hr)); return false; }
     REFERENCE_TIME lat = 0;
     if (SUCCEEDED(cl->GetStreamLatency(&lat))) n->streamLatMs = (double)lat / 10000.0;
-    UINT32 pre = std::min<UINT32>(bf, (UINT32)(rate / 100));
+    UINT32 pre = std::min<UINT32>(bf, (UINT32)(rate / (g_live.load() ? 400 : 100)));
     BYTE* out = nullptr;
     if (SUCCEEDED(ren->GetBuffer(pre, &out))) ren->ReleaseBuffer(pre, AUDCLNT_BUFFERFLAGS_SILENT);
     hr = cl->Start();
     if (FAILED(hr)) { SetErr(n, HrMsg(L"Start fehlgeschlagen", hr)); return false; }
     n->bufFrames = bf;
     n->rate = rate;
+    n->lowLat = low; n->devPeriodMs = perMs;
     n->client = cl.p; cl.p = nullptr;
     n->ren = ren.p; ren.p = nullptr;
     n->state = 1;
     n->openGen++;
-    Log("Ausgang geöffnet: %s (%d Hz, Puffer %u Frames, Stream-Latenz %.1f ms)", U8(n->name).c_str(), rate, bf, n->streamLatMs.load());
+    Log("Ausgang geöffnet: %s (%d Hz, Puffer %u Frames, Stream-Latenz %.1f ms%s, Periode %.1f ms)", U8(n->name).c_str(), rate, bf, n->streamLatMs.load(), low ? ", Low-Latency" : "", perMs);
     return true;
 }
 
@@ -493,6 +671,7 @@ static void IngestGen(Node* n, double now) {
 static void IngestCapture(Node* n, double now) {
     bool got = false;
     float pl = 0, pr = 0;
+    const int pairSel = n->inPair.load(); const int c0 = (2 * pairSel + 1 < n->ch) ? 2 * pairSel : 0;   // Mehrkanal-Eingang: gewaehltes Stereo-Paar
     for (;;) {
         UINT32 pkt = 0;
         HRESULT hr = n->cap->GetNextPacketSize(&pkt);
@@ -509,8 +688,8 @@ static void IngestCapture(Node* n, double now) {
             for (UINT32 i = 0; i < fr; i++) n->sb.push(0, 0);
         } else {
             for (UINT32 i = 0; i < fr; i++) {
-                float l = ReadSample(data, n->bits, n->isFloat, (size_t)i * n->ch);
-                float r = (n->ch > 1) ? ReadSample(data, n->bits, n->isFloat, (size_t)i * n->ch + 1) : l;
+                float l = ReadSample(data, n->bits, n->isFloat, (size_t)i * n->ch + c0);
+                float r = (n->ch > c0 + 1) ? ReadSample(data, n->bits, n->isFloat, (size_t)i * n->ch + c0 + 1) : l;
                 n->sb.push(l, r);
                 pl = std::max(pl, std::fabs(l));
                 pr = std::max(pr, std::fabs(r));
@@ -571,6 +750,8 @@ static void IngestAirplay(Node* n, double now) {
 }
 
 static double LagFor(Node* src, Node* dst) {
+    if (g_live.load() && (dst->kind == K_OUT || dst->kind == K_VOUT) && dst->liveDirect.load())   // Live: kleine adaptive Latenz, kein Ausgleichs-Delay
+        return std::max(g_liveCtl.lagMs() + src->delayMs.load() + dst->trimMs.load(), 1.0);
     double v = (double)g_baseMs.load() + src->delayMs.load() + dst->delayMs.load() + dst->trimMs.load();
     return std::max(v, 5.0);
 }
@@ -628,11 +809,26 @@ static inline float ProbeNext(Node* n) {
     return v;
 }
 
+static inline void PutFrame(BYTE* b, UINT32 i, const Node* n, float l, float r) {   // Exklusiv: Frame im Geraeteformat schreiben
+    const int ch = n->outCh, bits = n->outBits;
+    BYTE* p = b + (size_t)i * (size_t)ch * (size_t)bits / 8;
+    for (int c = 0; c < ch; c++) {
+        float v = c == 0 ? l : c == 1 ? r : 0.0f;
+        if (bits == 32 && n->outFloat) ((float*)p)[c] = v;
+        else if (bits == 32) { int32_t q = (int32_t)std::llround((double)v * 2147483647.0); if (n->outValid <= 24) q &= ~0xFF; ((int32_t*)p)[c] = q; }
+        else if (bits == 24) { int32_t q = (int32_t)std::lrintf(v * 8388607.0f); BYTE* d = p + (size_t)c * 3; d[0] = (BYTE)q; d[1] = (BYTE)(q >> 8); d[2] = (BYTE)(q >> 16); }
+        else ((int16_t*)p)[c] = (int16_t)std::lrintf(v * 32767.0f);
+    }
+}
+
 static void RenderOutput(Node* n) {
     UINT32 pad = 0;
     HRESULT hr = n->client->GetCurrentPadding(&pad);
     if (FAILED(hr)) { FailNode(n, HrMsg(L"Ausgang verloren (abgesteckt?)", hr)); return; }
-    UINT32 target = (UINT32)((int64_t)n->rate * g_padMs.load() / 1000);
+    const bool fast = g_live.load() || n->exclActive;   // Live/Exklusiv: Fuellstand knapp ueber einer Geraeteperiode halten
+    const double padMs = fast ? std::max(2.5, n->devPeriodMs * 1.6 + 0.5) : (double)g_padMs.load();
+    UINT32 target = (UINT32)((double)n->rate * padMs / 1000.0);
+    if (n->bufFrames > 1 && target >= n->bufFrames) target = n->bufFrames - 1;
     UINT32 want = pad < target ? target - pad : 0;
     if (want > n->bufFrames - pad) want = n->bufFrames - pad;
     if (pad == 0) g_underruns++;
@@ -645,6 +841,7 @@ static void RenderOutput(Node* n) {
     hr = n->ren->GetBuffer(want, &out);
     if (FAILED(hr)) { FailNode(n, HrMsg(L"Ausgang verloren (abgesteckt?)", hr)); return; }
     float* o = (float*)out;
+    const bool xf = n->exclActive;
     const float g = n->mute.load() ? 0.0f : n->gainLin.load();
     float pl = 0, pr = 0;
     for (UINT32 i = 0; i < want; i++) {
@@ -652,8 +849,8 @@ static void RenderOutput(Node* n) {
         if (probing && n->probeState.load() == 2) { float pv = ProbeNext(n); l += pv; r += pv; }
         pl = std::max(pl, std::fabs(l));
         pr = std::max(pr, std::fabs(r));
-        o[2 * i] = std::max(-1.0f, std::min(1.0f, l));
-        o[2 * i + 1] = std::max(-1.0f, std::min(1.0f, r));
+        l = std::max(-1.0f, std::min(1.0f, l)); r = std::max(-1.0f, std::min(1.0f, r));
+        if (xf) PutFrame(out, i, n, l, r); else { o[2 * i] = l; o[2 * i + 1] = r; }
     }
     n->ren->ReleaseBuffer(want, 0);
     UpdatePeak(n, pl, pr);
@@ -699,12 +896,119 @@ static void ProduceStream(Node* n, double now) {
     }
 }
 
+// ======================================================================= Virtuelle Bruecke (ASIO-Treiber <-> Router)
+
+static bool VBusOpen() {
+    if (g_vb) return true;
+    if (!vbus_win::Attach(&g_vb, &g_vbMap)) { g_vb = nullptr; return false; }
+    g_vb->routerOn.store(1); g_vb->layout.store((uint32_t)g_vbLayout.load());
+    g_vbRd.reset(); g_vbEpoch = g_vb->epoch.load(); g_vbRate = std::max(8000, std::min(768000, (int)g_vb->rate.load())); g_vbDrvOn = false;
+    Log("Virtuelle Brücke geöffnet (Local\\BensVBus1)");
+    return true;
+}
+static void VBusClose() {
+    if (!g_vb) return;
+    g_vb->routerOn.store(0);
+    vbus_win::Detach(&g_vb, &g_vbMap);
+    for (Node* n : g_nodes) if (n->kind == K_VIN || n->kind == K_VOUT) CloseNode(n);
+    Log("Virtuelle Brücke geschlossen");
+}
+static bool OpenVIn(Node* n) {
+    if (!g_vb) { SetErr(n, L"Virtuelle Brücke ist aus (Studio → Virtuelle Eingänge)"); return false; }
+    n->rate = g_vbRate; n->ch = 2; n->bits = 32; n->isFloat = true; n->sb.init(n->rate, RING_SECONDS);
+    n->vbLast = NowSec(); n->lastPacket = n->vbLast; n->state = 1; n->openGen++;
+    Log("Virtueller Eingang bereit: %s (%d Hz)", U8(n->name).c_str(), n->rate);
+    return true;
+}
+static bool OpenVOut(Node* n) {
+    if (!g_vb) { SetErr(n, L"Virtuelle Brücke ist aus (Studio → Virtuelle Eingänge)"); return false; }
+    n->rate = g_vbRate; n->ch = 2; n->state = 1; n->openGen++;
+    Log("Virtueller Ausgang bereit: %s (%d Hz)", U8(n->name).c_str(), n->rate);
+    return true;
+}
+// Laeuft in jedem Durchgang der Audio-Schleife (unter g_cs): Brueckenstatus, DAW -> Router (virtuelle Eingaenge), Router -> DAW (virtuelle Ausgaenge)
+static void VBusPump(double now) {
+    if (g_vbWanted.load() != (g_vb != nullptr)) { if (g_vbWanted.load()) VBusOpen(); else VBusClose(); }
+    if (!g_vb) return;
+    const uint64_t nowNs = vbus_win::NowNs();
+    g_vb->routerBeatNs.store(nowNs); g_vb->routerOn.store(1); g_vb->layout.store((uint32_t)g_vbLayout.load());
+    const bool drvOn = g_vb->driverOn.load() != 0 && vbus::Fresh(g_vb->driverBeatNs.load(), nowNs);
+    const uint32_t ep = g_vb->epoch.load(); const int rate = std::max(8000, std::min(768000, (int)g_vb->rate.load()));
+    if (ep != g_vbEpoch || rate != g_vbRate || drvOn != g_vbDrvOn) {
+        const bool rateChange = rate != g_vbRate;
+        g_vbEpoch = ep; g_vbRate = rate; g_vbDrvOn = drvOn; g_vbRd.reset(); g_vbOutT0 = now; g_vbOutDone = 0;
+        if (rateChange) for (Node* n : g_nodes) if ((n->kind == K_VIN || n->kind == K_VOUT) && n->state.load() == 1) CloseNode(n);   // Neuoeffnen mit neuer Rate
+        Log("Brücke: Treiber %s, %d Hz, Puffer %u", drvOn ? "aktiv" : "inaktiv", rate, (unsigned)g_vb->bufFrames.load());
+    }
+    const vbus::Layout& LY = vbus::GetLayout(g_vbLayout.load());
+    // ---- DAW -> Router
+    bool anyIn = false; for (Node* n : g_nodes) if (n->kind == K_VIN && n->state.load() == 1) { anyIn = true; break; }
+    if (anyIn) {
+        g_vbIn16.resize((size_t)4096 * vbus::CH); g_vbTmp.resize((size_t)4096 * 2);
+        if (drvOn) {
+            size_t got;
+            while ((got = vbus::ReadAll(g_vbRd, g_vb->outW, vbus::OutRing(g_vb), g_vb->ringFrames, g_vbIn16.data(), 4096, (size_t)(rate * 0.004))) > 0) {
+                for (Node* n : g_nodes) {
+                    if (n->kind != K_VIN || n->state.load() != 1) continue;
+                    float pl = 0, pr = 0;
+                    if (n->vbIdx < 100) {
+                        const int p = std::max(0, std::min(7, n->vbIdx));
+                        for (size_t i = 0; i < got; i++) { float l = g_vbIn16[i * vbus::CH + 2 * p], r = g_vbIn16[i * vbus::CH + 2 * p + 1]; n->sb.push(l, r); pl = std::max(pl, std::fabs(l)); pr = std::max(pr, std::fabs(r)); }
+                    } else {
+                        const int gi = n->vbIdx - 100;
+                        if (gi >= LY.ngroups) { for (size_t i = 0; i < got; i++) n->sb.push(0, 0); }
+                        else {
+                            vbus::DownmixFrames(g_vbIn16.data(), got, LY.g[gi].first, LY.g[gi].type, g_vbTmp.data());
+                            for (size_t i = 0; i < got; i++) { float l = g_vbTmp[2 * i], r = g_vbTmp[2 * i + 1]; n->sb.push(l, r); pl = std::max(pl, std::fabs(l)); pr = std::max(pr, std::fabs(r)); }
+                        }
+                    }
+                    n->vbLast = now; n->lastPacket = now; UpdatePeak(n, pl, pr);
+                }
+                if (got < 4096) break;
+            }
+        } else {   // kein Host verbunden: Stille nach Uhr, damit nachgelagerte Kabel weiterlaufen
+            for (Node* n : g_nodes) {
+                if (n->kind != K_VIN || n->state.load() != 1) continue;
+                uint64_t fr = (uint64_t)std::max(0.0, (now - n->vbLast) * n->rate);
+                for (uint64_t i = 0; i < fr && i < (uint64_t)n->rate; i++) n->sb.push(0, 0);
+                if (fr > 0) n->vbLast = now;
+            }
+        }
+    }
+    // ---- Router -> DAW
+    bool anyOut = false; for (Node* n : g_nodes) if (n->kind == K_VOUT && n->state.load() == 1) { anyOut = true; break; }
+    if (drvOn && anyOut) {
+        uint64_t due = (uint64_t)std::max(0.0, (now - g_vbOutT0) * rate);
+        if (due > g_vbOutDone + (uint64_t)(rate / 4)) g_vbOutDone = due;   // nicht nachholen
+        while (g_vbOutDone < due) {
+            size_t blk = (size_t)std::min<uint64_t>(due - g_vbOutDone, 1024);
+            g_vbOut16.assign(blk * vbus::CH, 0.0f);
+            for (Node* n : g_nodes) {
+                if (n->kind != K_VOUT || n->state.load() != 1) continue;
+                const int p = std::max(0, std::min(7, n->vbIdx));
+                n->acc.assign(blk * 2, 0.0f);
+                MixInto(n, rate, (int)blk);
+                const float g = n->mute.load() ? 0.0f : n->gainLin.load(); float pl = 0, pr = 0;
+                for (size_t i = 0; i < blk; i++) { float l = n->acc[2 * i] * g, r = n->acc[2 * i + 1] * g; pl = std::max(pl, std::fabs(l)); pr = std::max(pr, std::fabs(r)); g_vbOut16[i * vbus::CH + 2 * p] = l; g_vbOut16[i * vbus::CH + 2 * p + 1] = r; }
+                UpdatePeak(n, pl, pr);
+            }
+            vbus::Write(g_vb->inW, vbus::InRing(g_vb), g_vb->ringFrames, g_vbOut16.data(), blk);
+            g_vbOutDone += blk;
+        }
+    } else { g_vbOutT0 = now; g_vbOutDone = 0; }
+}
+
 // ======================================================================= Aufnahme-Box (WAV)
 
 static const wchar_t* RecFmtName(int bits, bool flac) {
     if (flac) return bits == 16 ? L"FLAC 16 Bit" : L"FLAC 24 Bit";
     return bits == 16 ? L"WAV 16 Bit" : bits == 32 ? L"WAV 32 Bit Float" : L"WAV 24 Bit";
 }
+static std::wstring RecFmtFull(const RecCtx* rc) {
+    if (!rc->flac && rc->bits == 32 && rc->int32) return L"WAV 32 Bit Ganzzahl";
+    return RecFmtName(rc->bits, rc->flac);
+}
+static std::vector<Conn*> RecIns(Node* n) { std::vector<Conn*> v; for (Conn* c : g_conns) if (c->dst == n && v.size() < 8) v.push_back(c); return v; }
 
 static bool OpenSum(Node* n) {   // reines Routing-Modul: kein Geraet, kein Takt
     n->state = 1;
@@ -716,39 +1020,100 @@ static bool OpenSum(Node* n) {   // reines Routing-Modul: kein Geraet, kein Takt
 
 static bool OpenRec(Node* n, double now) {
     if (!n->rc) { SetErr(n, L"Aufnahme-Kontext fehlt"); return false; }
-    n->rc->t0 = now;
-    n->rc->framesOut = 0;
-    n->rate = n->rc->rate;
+    RecCtx* rc = n->rc;
+    rc->t0 = now;
+    rc->framesOut = 0;
+    rc->bpSync = false; rc->armSig = 0;
+    n->rate = rc->rate;
     n->ch = 2;
     n->state = 1;
     n->openGen++;
+    rc->al.init(rc->rate); rc->al.set(rc->alp); rc->alRate = rc->rate;
     Log("Aufnahme-Box bereit: %s (%d Hz)", U8(n->name).c_str(), n->rate);
     return true;
+}
+
+static void RecApplyArm(Node* n, int ch) {   // Vorlauf-Puffer passend zur Konfiguration halten (nur bei Aenderung)
+    RecCtx* rc = n->rc;
+    int64_t sig = (int64_t)rc->rate * 1000003 + (int64_t)ch * 101 + (int64_t)(rc->preRoll * 10);
+    if (sig != rc->armSig) { rc->armSig = sig; rc->rec.arm(rc->rate, ch, rc->preRoll); }
+}
+
+// Bit-perfekt: genau eine Quelle, Quelltakt, ohne Skalierung/Resampling/Gain direkt in die Datei (Messung laeuft mit)
+static void ProduceRecBP(Node* n, double now) {
+    (void)now;
+    RecCtx* rc = n->rc;
+    std::vector<Conn*> ins = RecIns(n);
+    Node* s = ins.size() == 1 ? ins[0]->src : nullptr;
+    dyn::Params off = rc->alp; off.mode = 0; rc->al.set(off);
+    if (!s || s->kind == K_SUM || s->state.load() != 1 || s->rate <= 0) { rc->bpSync = false; return; }
+    if (s->rate != rc->rate) {
+        if (rc->rec.active()) return;   // Quellrate hat sich waehrend der Aufnahme geaendert: warten (Start/Stopp noetig)
+        rc->rate = s->rate; n->rate = s->rate; rc->al.init(rc->rate); rc->al.set(off); rc->alRate = rc->rate; rc->armSig = 0;
+    }
+    RecApplyArm(n, 2);
+    const uint64_t head = s->sb.head.load(std::memory_order_acquire);
+    const size_t cap = s->sb.cap;
+    if (!rc->bpSync || rc->bpGen != s->openGen) { rc->bpPos = head; rc->bpSync = true; rc->bpGen = s->openGen; }
+    if (head - rc->bpPos > cap / 2) { Log("Bit-perfekt: Aufnahme-Box kam nicht hinterher (%.1f s verworfen)", (double)(head - rc->bpPos) / rc->rate); rc->bpPos = head; }
+    float pl = 0, pr = 0;
+    while (rc->bpPos < head) {
+        size_t i = (size_t)(rc->bpPos % cap), cnt = (size_t)std::min<uint64_t>(head - rc->bpPos, std::min<uint64_t>(cap - i, 4096));
+        const float* p = &s->sb.d[i * 2];
+        for (size_t k = 0; k < cnt; k++) { pl = std::max(pl, std::fabs(p[2 * k])); pr = std::max(pr, std::fabs(p[2 * k + 1])); }
+        rc->mtTmp.assign(p, p + cnt * 2); rc->al.process(rc->mtTmp.data(), cnt);   // nur Messung
+        rc->rec.monitor(p, cnt);
+        rc->bpPos += cnt; rc->framesOut += cnt;
+    }
+    UpdatePeak(n, pl, pr);
 }
 
 // Eigener Takt wie beim Stream-Ausgang: Quellen werden auf die Aufnahme-Samplerate resampelt (Drift-Regelung inklusive).
 static void ProduceRec(Node* n, double now) {
     RecCtx* rc = n->rc;
+    if (rc->bitperfect) { ProduceRecBP(n, now); return; }
     const int rate = rc->rate;
+    if (rc->alRate != rate) { rc->al.init(rate); rc->al.set(rc->alp); rc->alRate = rate; }
+    else rc->al.set(rc->alp);
     uint64_t due = (uint64_t)std::max(0.0, (now - rc->t0) * rate);
     if (due > rc->framesOut + (uint64_t)rate * 2) {   // Engine war blockiert: nicht nachholen, sonst entstuenden Luecken im Pegel
         Log("Aufnahme-Box: Takt neu aufgesetzt (Engine war %.1f s blockiert)", (double)(due - rc->framesOut) / rate);
         rc->framesOut = due;
     }
+    const bool mt = rc->multitrack != 0;
+    std::vector<Conn*> ins = RecIns(n);
+    const int pairs = mt ? (rc->rec.active() ? std::max(1, rc->curCh / 2) : std::max(1, (int)ins.size())) : 1;
+    const int CH = pairs * 2;
+    if (!rc->rec.active()) rc->curCh = CH;
+    RecApplyArm(n, CH);
     while (rc->framesOut < due) {
         size_t frames = (size_t)std::min<uint64_t>(due - rc->framesOut, 4096);
-        n->acc.assign(frames * 2, 0.0f);
-        if (!g_calibActive.load()) MixInto(n, rate, (int)frames);
         const float g = n->mute.load() ? 0.0f : n->gainLin.load();
         float pl = 0, pr = 0;
-        for (size_t i = 0; i < frames * 2; i += 2) {
-            float l = n->acc[i] * g, r = n->acc[i + 1] * g;
-            pl = std::max(pl, std::fabs(l));
-            pr = std::max(pr, std::fabs(r));
-            n->acc[i] = l;
-            n->acc[i + 1] = r;
+        if (!mt) {
+            n->acc.assign(frames * 2, 0.0f);
+            if (!g_calibActive.load()) MixInto(n, rate, (int)frames);
+            for (size_t i = 0; i < frames * 2; i++) n->acc[i] *= g;
+            rc->al.process(n->acc.data(), frames);   // Messung immer, Regelung je nach Modus
+            for (size_t i = 0; i < frames * 2; i += 2) { pl = std::max(pl, std::fabs(n->acc[i])); pr = std::max(pr, std::fabs(n->acc[i + 1])); }
+            rc->rec.monitor(n->acc.data(), frames);
+        } else {   // Mehrspur: jedes Kabel = ein Stereo-Paar (Kanal 1/2, 3/4, ...)
+            rc->mtOut.assign(frames * (size_t)CH, 0.0f);
+            for (int k = 0; k < pairs && k < (int)ins.size(); k++) {
+                Conn* c = ins[(size_t)k]; Node* sn = c->src;
+                rc->mtTmp.assign(frames * 2, 0.0f);
+                if (!g_calibActive.load()) {
+                    if (sn->kind == K_SUM) { if (sn->state.load() == 1) { n->acc.assign(frames * 2, 0.0f); MixSum(c, n, rate, (int)frames); rc->mtTmp = n->acc; } }
+                    else if (sn->state.load() == 1) { if (c->gen != sn->openGen) { c->cs = ConnState(); c->gen = sn->openGen; } ProcessConn(c->cs, sn->sb, rate, LagFor(sn, n), (int)frames, rc->mtTmp.data(), sn->mute.load() ? 0.0f : sn->gainLin.load()); }
+                }
+                for (size_t i = 0; i < frames; i++) {
+                    float l = rc->mtTmp[2 * i] * g, r = rc->mtTmp[2 * i + 1] * g;
+                    rc->mtOut[i * (size_t)CH + (size_t)(2 * k)] = l; rc->mtOut[i * (size_t)CH + (size_t)(2 * k) + 1] = r;
+                    pl = std::max(pl, std::fabs(l)); pr = std::max(pr, std::fabs(r));
+                }
+            }
+            rc->rec.monitor(rc->mtOut.data(), frames);
         }
-        if (rc->rec.active()) rc->rec.push(n->acc.data(), frames);
         rc->framesOut += frames;
         UpdatePeak(n, pl, pr);
     }
@@ -770,6 +1135,13 @@ static bool RecStart(Node* n) {
     if (!rc) return false;
     if (rc->rec.active()) return true;
     if (!g_running || n->state.load() != 1) { rc->err = L"Erst „Start“ drücken – die Box muss grün leuchten."; return false; }
+    std::vector<Conn*> ins = RecIns(n);
+    int ch = rc->multitrack ? 2 * std::max(1, (int)ins.size()) : 2, rate = rc->rate;
+    if (rc->bitperfect) {
+        if (ins.size() != 1 || ins[0]->src->kind == K_SUM || ins[0]->src->state.load() != 1 || ins[0]->src->rate <= 0) { rc->err = L"Bit-perfekt: genau EINE laufende Quelle verbinden (kein Summen-Modul)."; return false; }
+        rate = ins[0]->src->rate; ch = 2;
+    }
+    if (rc->flac && ch != 2) { rc->err = L"FLAC kennt nur Stereo – für Mehrspur bitte WAV wählen."; return false; }
     std::wstring d = rc->dir.empty() ? RecDefaultDir() : rc->dir;
     while (d.size() > 3 && (d.back() == L'\\' || d.back() == L'/')) d.pop_back();
     if (!RecMkDirs(d)) { rc->err = L"Zielordner nicht verfügbar: " + d; return false; }
@@ -777,13 +1149,20 @@ static bool RecStart(Node* n) {
     GetLocalTime(&st);
     wchar_t nm[96];
     swprintf(nm, 96, L"\\Aufnahme_%04d-%02d-%02d_%02d-%02d-%02d.%ls", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, rc->flac ? L"flac" : L"wav");
+    wavrec::Options o; o.path = U8(d + nm); o.rate = rate; o.bits = rc->bits; o.flac = rc->flac; o.int32 = rc->int32; o.channels = ch; o.dither = rc->dither;
+    o.splitSeconds = rc->splitMin > 0 ? rc->splitMin * 60.0 : 0.0;
+    o.description = "Bens Audio Router - " + U8(n->name) + (rc->bitperfect ? " (bit-perfekt)" : "");
+    double pre = rc->rec.armedSeconds(); uint64_t sod = ((uint64_t)st.wHour * 3600 + (uint64_t)st.wMinute * 60 + (uint64_t)st.wSecond) * (uint64_t)rate, pf = (uint64_t)(pre * rate);
+    o.timeRefSamples = sod > pf ? sod - pf : 0;
     std::string err;
     EnterCriticalSection(&g_cs);   // kein push() des Audio-Threads waehrend des Starts
-    bool ok = rc->rec.start(U8(d + nm), rc->rate, rc->bits, rc->flac, err);
+    rc->curCh = ch; if (rate != rc->rate) { rc->rate = rate; n->rate = rate; rc->al.init(rate); rc->alRate = rate; rc->armSig = 0; }
+    bool ok = rc->rec.start(o, err);
     LeaveCriticalSection(&g_cs);
     if (!ok) { rc->err = W8(err); Log("Aufnahme: Start fehlgeschlagen – %s", err.c_str()); return false; }
+    rc->al.resetPeaks();
     rc->err.clear();
-    Log("Aufnahme gestartet: %s (%ls, %d Hz)", U8(d + nm).c_str(), RecFmtName(rc->bits, rc->flac), rc->rate);
+    Log("Aufnahme gestartet: %s (%ls, %d Hz, %d Kanäle%ls)", o.path.c_str(), RecFmtFull(rc).c_str(), rate, ch, rc->bitperfect ? L", bit-perfekt" : L"");
     return true;
 }
 
@@ -794,28 +1173,42 @@ static void RecStop(Node* n) {
     EnterCriticalSection(&g_cs);
     rc->rec.stop();
     LeaveCriticalSection(&g_cs);
-    if (was) Log("Aufnahme beendet: %.1f s, %.1f MB%s", (double)rc->rec.frames() / std::max(1, rc->rate), (double)rc->rec.bytes() / 1048576.0,
+    if (was) Log("Aufnahme beendet: %.1f s, %.1f MB, %u Datei(en), Spitze %.1f dBTP%s", (double)rc->rec.frames() / std::max(1, rc->rate), (double)rc->rec.bytes() / 1048576.0, (unsigned)rc->rec.parts(), (double)rc->al.truePeakDb(),
                  rc->rec.overruns() ? " – ACHTUNG: Aussetzer (Platte zu langsam)" : "");
 }
 static void RecToggle(Node* n) { if (n && n->rc) { if (n->rc->rec.active()) RecStop(n); else RecStart(n); } }
 
+static std::wstring RecMeterText(RecCtx* rc) {
+    wchar_t b[160]; std::wstring t;
+    float sl = rc->al.shortLufs(), tp = rc->al.truePeakDb();
+    if (sl > -100.0f) { swprintf(b, 160, L" · %.1f LUFS", (double)sl); t += b; }
+    if (tp > -100.0f) { swprintf(b, 160, L" · Spitze %.1f dBTP", (double)tp); t += b; }
+    if (rc->alp.mode == 2 && !rc->bitperfect) { swprintf(b, 160, L" · Pegel %+.1f dB", (double)rc->al.gainDb()); t += b; }
+    if (rc->al.limiterDb() > 0.1f && rc->alp.mode > 0 && !rc->bitperfect) { swprintf(b, 160, L" · Limiter −%.1f dB", (double)rc->al.limiterDb()); t += b; }
+    return t;
+}
 static std::wstring RecStatusLine(Node* n) {
     RecCtx* rc = n->rc;
     if (!rc) return L"";
     if (n->state.load() == 2) return std::wstring(L"! ") + n->err;
     if (!g_running) return L"Engine gestoppt – Start drücken";
     if (rc->rec.failed()) return L"! " + W8(rc->rec.lastError());
-    wchar_t b[200];
+    wchar_t b[260];
     if (rc->rec.active()) {
         double s = (double)rc->rec.frames() / std::max(1, rc->rate);
-        swprintf(b, 200, L"● %02d:%02d:%02d · %.1f MB", (int)(s / 3600), ((int)s / 60) % 60, (int)s % 60, (double)rc->rec.bytes() / 1048576.0);
+        swprintf(b, 260, L"● %02d:%02d:%02d · %.1f MB", (int)(s / 3600), ((int)s / 60) % 60, (int)s % 60, (double)rc->rec.bytes() / 1048576.0);
         std::wstring t = b;
+        if (rc->rec.parts() > 1) t += L" · Teil " + std::to_wstring(rc->rec.parts());
+        t += RecMeterText(rc);
         if (rc->rec.overruns()) t += L" · ! Aussetzer";
         return t;
     }
     if (!rc->err.empty()) return L"! " + rc->err;
-    swprintf(b, 200, L"bereit · %ls · %d Hz", RecFmtName(rc->bits, rc->flac), rc->rate);
-    return b;
+    std::wstring ch = rc->bitperfect ? L"bit-perfekt" : rc->multitrack ? std::to_wstring(2 * std::max(1, (int)RecIns(n).size())) + L" Kanäle" : L"Stereo";
+    swprintf(b, 260, L"bereit · %ls · %d Hz · %ls", RecFmtFull(rc).c_str(), rc->rate, ch.c_str());
+    std::wstring t = b;
+    if (rc->preRoll > 0) { swprintf(b, 260, L" · Vorlauf %.0f s", rc->preRoll); t += b; }
+    return t + RecMeterText(rc);
 }
 
 static DWORD WINAPI AudioProc(LPVOID) {
@@ -823,8 +1216,12 @@ static DWORD WINAPI AudioProc(LPVOID) {
     CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void**)&g_enumA);
     DWORD task = 0;
     HANDLE mm = AvSetMmThreadCharacteristicsW(L"Pro Audio", &task);
+    timeBeginPeriod(1);
+    HANDLE hTimer = CreateWaitableTimerExW(nullptr, nullptr, 0x2 /*CREATE_WAITABLE_TIMER_HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
+    double lastLiveTick = 0;
     while (g_running) {
-        Sleep(g_pollMs.load());
+        if (g_live.load() && hTimer) { LARGE_INTEGER due; due.QuadPart = -10000; SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, FALSE); WaitForSingleObject(hTimer, 8); }   // Live: 1 ms genau
+        else Sleep(g_live.load() ? 1 : g_pollMs.load());
         double t0 = NowSec();
         EnterCriticalSection(&g_cs);
         for (Node* g : g_graveyard)
@@ -832,7 +1229,7 @@ static DWORD WINAPI AudioProc(LPVOID) {
         for (Node* n : g_nodes) {
             int st = n->state.load();
             if (st == 0 || (st == 2 && t0 >= n->retryAt)) {
-                bool ok = n->kind == K_OUT ? OpenOutput(n) : n->kind == K_STREAM ? OpenStream(n, t0) : n->kind == K_REC ? OpenRec(n, t0) : n->kind == K_SUM ? OpenSum(n) : OpenSource(n);
+                bool ok = (n->kind == K_OUT || n->kind == K_VOUT) ? OpenOutput(n) : n->kind == K_STREAM ? OpenStream(n, t0) : n->kind == K_REC ? OpenRec(n, t0) : n->kind == K_SUM ? OpenSum(n) : OpenSource(n);
                 if (!ok) {
                     n->state = 2;
                     n->retryAt = t0 + 2.0;
@@ -841,11 +1238,12 @@ static DWORD WINAPI AudioProc(LPVOID) {
             }
         }
         for (Node* n : g_nodes) {
-            if (IsSink(n->kind) || n->kind == K_SUM || n->remote || n->state.load() != 1) continue;
+            if (IsSink(n->kind) || n->kind == K_SUM || n->kind == K_VIN || n->remote || n->state.load() != 1) continue;
             if (n->kind == K_GEN) IngestGen(n, t0);
             else if (n->kind == K_AIRPLAY) IngestAirplay(n, t0);
             else IngestCapture(n, t0);
         }
+        VBusPump(t0);   // virtuelle Bruecke: DAW -> virtuelle Eingaenge, virtuelle Ausgaenge -> DAW
         for (Node* n : g_nodes) {
             if (n->state.load() != 1) continue;
             if (n->kind == K_OUT) RenderOutput(n);
@@ -861,6 +1259,11 @@ static DWORD WINAPI AudioProc(LPVOID) {
             }
             else if (n->kind == K_REC) ProduceRec(n, t0);
         }
+        if (g_live.load() && t0 - lastLiveTick >= 0.1) {   // adaptive Live-Latenz: Aussetzer und Neu-Synchronisierungen auswerten
+            lastLiveTick = t0; uint32_t rs = 0;
+            for (Conn* c : g_conns) { rs += (uint32_t)c->cs.resyncs; for (SubState& x : c->sub) rs += (uint32_t)x.cs.resyncs; }
+            g_resyncs = rs; g_liveCtl.tick(t0, g_underruns.load(), rs);
+        }
         LeaveCriticalSection(&g_cs);
         float us = (float)((NowSec() - t0) * 1e6);
         g_loopUs.store(g_loopUs.load() * 0.95f + us * 0.05f);
@@ -870,6 +1273,8 @@ static DWORD WINAPI AudioProc(LPVOID) {
     for (Node* g : g_graveyard) { CloseNode(g); g->closed = true; }
     LeaveCriticalSection(&g_cs);
     if (g_enumA) { g_enumA->Release(); g_enumA = nullptr; }
+    if (hTimer) CloseHandle(hTimer);
+    timeEndPeriod(1);
     if (mm) AvRevertMmThreadCharacteristics(mm);
     CoUninitialize();
     return 0;
@@ -909,7 +1314,7 @@ static Node* AddNode(int kind, const std::wstring& devId, const std::wstring& na
     if (kind == K_GEN) n->genType = (devId == L"gen:sine") ? G_SINE : (devId == L"gen:pink") ? G_PINK : (devId == L"gen:simmic") ? G_SIMMIC : G_CLICK;
     if (kind == K_STREAM) n->st = new StreamCtx();
     if (kind == K_AIRPLAY) { n->ap = new AirplayCtx(); n->ap->latencyFn = ApLatencyFn; n->ap->latencyArg = n; }
-    if (kind == K_REC) { n->rc = new RecCtx(); n->rc->dir = RecDefaultDir(); }
+    if (kind == K_REC) { n->rc = new RecCtx(); n->rc->dir = RecDefaultDir(); n->rc->alp.mode = 2; }
     if (devId == L"remote:phone") n->remote = true;
     EnterCriticalSection(&g_cs);
     g_nodes.push_back(n);
@@ -1293,6 +1698,10 @@ static std::vector<std::wstring> Split(const std::wstring& s, wchar_t sep) {
 
 static std::wstring GraphPath() { return AppDir() + L"\\graph.txt"; }
 
+static const int REC_RATES[] = {44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000};
+static bool RecRateOk(int r) { for (int x : REC_RATES) if (x == r) return true; return false; }
+static int RecFmtIndex(const RecCtx* rc) { return rc->flac ? (rc->bits == 16 ? 2 : 1) : rc->bits == 16 ? 3 : rc->bits == 32 ? (rc->int32 ? 5 : 4) : 0; }
+
 static bool SaveGraphTo(const std::wstring& path) {
     FILE* f = _wfopen(path.c_str(), L"wb");
     if (!f) return false;
@@ -1304,12 +1713,21 @@ static bool SaveGraphTo(const std::wstring& path) {
     wchar_t b[1200];
     swprintf(b, 1200, L"S\t%d\t%d\t%d\t%d\t%d", g_padMs.load(), g_baseMs.load(), g_pollMs.load(), g_drvMs.load(), g_autoSync ? 1 : 0);
     w(b);
+    swprintf(b, 1200, L"G\tlive\t%d", g_live.load() ? 1 : 0); w(b);
+    swprintf(b, 1200, L"G\tliveauto\t%d", g_liveCtl.isAuto() ? 1 : 0); w(b);
+    swprintf(b, 1200, L"G\tlivems\t%d", g_liveStartMs.load()); w(b);
+    swprintf(b, 1200, L"G\tvbus\t%d", g_vbWanted.load() ? 1 : 0); w(b);
+    swprintf(b, 1200, L"G\tvblayout\t%d", g_vbLayout.load()); w(b);
     for (Node* n : g_nodes) {
         swprintf(b, 1200, L"N\t%d\t%d\t%d\t%d\t%.1f\t%d\t%.3f\t%.3f\t%d\t%ls\t%ls", n->id, n->kind, (int)n->x, (int)n->y, n->gainDb,
                  n->mute.load() ? 1 : 0, n->delayMs.load(), n->extMs.load(), n->genType, n->devId.c_str(), n->name.c_str());
         w(b);
         swprintf(b, 1200, L"P\t%d\ttrim\t%.3f", n->id, n->trimMs.load());
         w(b);
+        if (n->kind == K_OUT || n->kind == K_CAPTURE) { swprintf(b, 1200, L"P\t%d\texcl\t%d", n->id, n->excl.load() ? 1 : 0); w(b); swprintf(b, 1200, L"P\t%d\texrate\t%d", n->id, n->exRate); w(b); }
+        if (n->kind == K_CAPTURE) { swprintf(b, 1200, L"P\t%d\tinpair\t%d", n->id, n->inPair.load()); w(b); }
+        if (n->kind == K_OUT || n->kind == K_VOUT) { swprintf(b, 1200, L"P\t%d\tlivedirect\t%d", n->id, n->liveDirect.load() ? 1 : 0); w(b); }
+        if (n->kind == K_VIN || n->kind == K_VOUT) { swprintf(b, 1200, L"P\t%d\tvbidx\t%d", n->id, n->vbIdx); w(b); }
         if (n->calibMs.load() >= 0) {
             swprintf(b, 1200, L"P\t%d\tcalib\t%.3f;%d;%d;%d;%.3f;%ls", n->id, n->calibMs.load(), n->calibPad, n->calibBurst, n->calibFmt,
                      n->calibMeas.load(), n->calibWhen);
@@ -1350,6 +1768,14 @@ static bool SaveGraphTo(const std::wstring& path) {
             swprintf(b, 1200, L"P\t%d\trecflac\t%d", n->id, n->rc->flac ? 1 : 0); w(b);
             swprintf(b, 1200, L"P\t%d\trecrate\t%d", n->id, n->rc->rate); w(b);
             w(L"P\t" + std::to_wstring(n->id) + L"\trecdir\t" + n->rc->dir);
+            RecCtx* r = n->rc;
+            swprintf(b, 1200, L"P\t%d\trecint32\t%d", n->id, r->int32 ? 1 : 0); w(b);
+            swprintf(b, 1200, L"P\t%d\trecdither\t%d", n->id, r->dither); w(b);
+            swprintf(b, 1200, L"P\t%d\trecmt\t%d", n->id, r->multitrack); w(b);
+            swprintf(b, 1200, L"P\t%d\trecbp\t%d", n->id, r->bitperfect ? 1 : 0); w(b);
+            swprintf(b, 1200, L"P\t%d\trecpre\t%.0f", n->id, r->preRoll); w(b);
+            swprintf(b, 1200, L"P\t%d\trecsplit\t%.0f", n->id, r->splitMin); w(b);
+            swprintf(b, 1200, L"P\t%d\trecal\t%d;%.1f;%.1f;%.1f;%d", n->id, r->alp.mode, r->alp.targetLufs, r->alp.maxBoostDb, r->alp.ceilingDb, r->alp.speed); w(b);
         }
         if (n->kind == K_SUM) { swprintf(b, 1200, L"P\t%d\tsummono\t%d", n->id, n->sumMono.load() ? 1 : 0); w(b); }
     }
@@ -1399,8 +1825,16 @@ static bool LoadGraphFrom(const std::wstring& path, bool replace) {
             g_pollMs = _wtoi(v[3].c_str());
             g_drvMs = _wtoi(v[4].c_str());
             g_autoSync = _wtoi(v[5].c_str()) != 0;
+        } else if (v[0] == L"G" && v.size() >= 3) {
+            int iv = _wtoi(v[2].c_str());
+            if (v[1] == L"live") g_live = iv != 0;
+            else if (v[1] == L"liveauto") g_liveCtl.setAuto(iv != 0);
+            else if (v[1] == L"livems") g_liveStartMs = std::max(2, std::min(40, iv));
+            else if (v[1] == L"vbus") g_vbWanted = iv != 0;
+            else if (v[1] == L"vblayout") g_vbLayout = std::max(0, std::min(vbus::NLAYOUTS - 1, iv));
         } else if (v[0] == L"N" && v.size() >= 12) {
             Node* n = AddNode(_wtoi(v[2].c_str()), v[10], v[11], (float)_wtoi(v[3].c_str()), (float)_wtoi(v[4].c_str()));
+            if (n->rc) n->rc->alp.mode = 0;   // alte Layouts ohne Auto-Pegel-Zeile: aus (Verhalten wie bisher)
             n->gainDb = std::min(0.0f, (float)_wtof(v[5].c_str()));
             n->gainLin = std::pow(10.0f, n->gainDb / 20.0f);
             n->mute = _wtoi(v[6].c_str()) != 0;
@@ -1415,6 +1849,11 @@ static bool LoadGraphFrom(const std::wstring& path, bool replace) {
             const std::wstring& k = v[2];
             const std::wstring& val = v[3];
             if (k == L"trim") n->trimMs = _wtof(val.c_str());
+            else if (k == L"excl") n->excl = _wtoi(val.c_str()) != 0;
+            else if (k == L"exrate") n->exRate = std::max(0, std::min(768000, _wtoi(val.c_str())));
+            else if (k == L"inpair") n->inPair = std::max(0, std::min(7, _wtoi(val.c_str())));
+            else if (k == L"livedirect") n->liveDirect = _wtoi(val.c_str()) != 0;
+            else if (k == L"vbidx") n->vbIdx = std::max(0, std::min(107, _wtoi(val.c_str())));
             else if (k == L"calib") {
                 auto f = Split(val, L';');
                 if (f.size() >= 5) {
@@ -1460,7 +1899,14 @@ static bool LoadGraphFrom(const std::wstring& path, bool replace) {
                 int iv = _wtoi(val.c_str());
                 if (k == L"recbits") r->bits = (iv == 16 || iv == 32) ? iv : 24;
                 else if (k == L"recflac") { r->flac = iv != 0; if (r->flac && r->bits == 32) r->bits = 24; }
-                else if (k == L"recrate") r->rate = (iv == 44100 || iv == 88200 || iv == 96000) ? iv : 48000;
+                else if (k == L"recrate") r->rate = RecRateOk(iv) ? iv : 48000;
+                else if (k == L"recint32") r->int32 = iv != 0 && r->bits == 32 && !r->flac;
+                else if (k == L"recdither") r->dither = std::max(-1, std::min(1, iv));
+                else if (k == L"recmt") r->multitrack = iv ? 1 : 0;
+                else if (k == L"recbp") r->bitperfect = iv != 0;
+                else if (k == L"recpre") r->preRoll = std::max(0, std::min(30, iv));
+                else if (k == L"recsplit") r->splitMin = std::max(0, std::min(600, iv));
+                else if (k == L"recal") { auto f = Split(val, L';'); if (f.size() >= 5) { r->alp.mode = std::max(0, std::min(2, _wtoi(f[0].c_str()))); r->alp.targetLufs = _wtof(f[1].c_str()); r->alp.maxBoostDb = _wtof(f[2].c_str()); r->alp.ceilingDb = _wtof(f[3].c_str()); r->alp.speed = std::max(0, std::min(2, _wtoi(f[4].c_str()))); } }
                 else if (k == L"recdir" && !val.empty()) r->dir = val;
             }
             else if (n->kind == K_SUM) {
@@ -1490,7 +1936,7 @@ static std::wstring SettingsPath() { return AppDir() + L"\\settings.ini"; }
 
 enum {
     IDC_BTN_SRC = 100, IDC_BTN_DST, IDC_BTN_STREAM, IDC_BTN_START, IDC_BTN_VIRT, IDC_BTN_ABOUT, IDC_BTN_LAYOUT, IDC_BTN_THEME,
-    IDC_CMB_PAD, IDC_CMB_BASE, IDC_CMB_POLL, IDC_CMB_DRV, IDC_TG_SYNC, IDC_BTN_SYNCNOW, IDC_BTN_RESCAN, IDC_BTN_REC, IDC_BTN_SUM, IDC_BTN_WEB, IDC_BTN_MORE, IDC_BTN_BG,
+    IDC_CMB_PAD, IDC_CMB_BASE, IDC_CMB_POLL, IDC_CMB_DRV, IDC_TG_SYNC, IDC_BTN_SYNCNOW, IDC_BTN_RESCAN, IDC_BTN_REC, IDC_BTN_SUM, IDC_BTN_WEB, IDC_BTN_MORE, IDC_BTN_BG, IDC_BTN_STUDIO, IDC_I_STUDIO,
     IDC_I_GAIN = 200, IDC_I_GAINVAL, IDC_I_MUTE, IDC_I_DLY_EDIT, IDC_I_DLY_SL, IDC_I_TRIM_EDIT, IDC_I_TRIM_SL, IDC_I_EXT_EDIT,
     IDC_I_GEN, IDC_I_SONOS, IDC_I_SEARCH, IDC_I_IP, IDC_I_PORT, IDC_I_SCHEME, IDC_I_RATE, IDC_I_BURST, IDC_I_BURSTVAL,
     IDC_I_AUTOLAT, IDC_I_DITHER, IDC_I_VOL, IDC_I_VOLVAL, IDC_I_PLAY, IDC_I_STOPSON, IDC_I_INFO, IDC_I_MEAS,
@@ -1536,7 +1982,7 @@ static const int TOOLBAR_H = 100, INSP_W = 328, STATUS_H = 26;
 
 static HWND g_canvas, g_insp;
 static HWND g_btnVirt, g_btnAbout;
-static HWND g_btnRec, g_btnSum, g_btnWeb, g_btnMore, g_btnBg;
+static HWND g_btnRec, g_btnSum, g_btnWeb, g_btnMore, g_btnBg, g_btnStudio;
 static HWND g_btnSrc, g_btnDst, g_btnStream, g_btnStart, g_btnLayout, g_btnTheme, g_btnSyncNow, g_btnRescan, g_tgSync;
 static HWND g_cmbPad, g_cmbBase, g_cmbPoll, g_cmbDrv;
 static HWND g_lblPad, g_lblBase, g_lblPoll, g_lblDrv;
@@ -1660,17 +2106,20 @@ static void BuildInspector() {
     SendMessageW(iRecFmt, CB_ADDSTRING, 0, (LPARAM)L"FLAC 16 Bit (verlustfrei, klein)");
     SendMessageW(iRecFmt, CB_ADDSTRING, 0, (LPARAM)L"WAV 16 Bit (mit Dither)");
     SendMessageW(iRecFmt, CB_ADDSTRING, 0, (LPARAM)L"WAV 32 Bit Float");
+    SendMessageW(iRecFmt, CB_ADDSTRING, 0, (LPARAM)L"WAV 32 Bit Ganzzahl");
     MkStatic(G_REC, L"Samplerate", 0, 142, 150, 14, SS_LEFT, g_fSmall, true);
     iRecRate = MkCombo(G_REC, IDC_I_RECRATE, 0, 158, 150);
     SendMessageW(iRecRate, CB_ADDSTRING, 0, (LPARAM)L"44100 Hz");
     SendMessageW(iRecRate, CB_ADDSTRING, 0, (LPARAM)L"48000 Hz");
     SendMessageW(iRecRate, CB_ADDSTRING, 0, (LPARAM)L"88200 Hz");
     SendMessageW(iRecRate, CB_ADDSTRING, 0, (LPARAM)L"96000 Hz");
+    for (const wchar_t* t : {L"176400 Hz", L"192000 Hz", L"352800 Hz", L"384000 Hz"}) SendMessageW(iRecRate, CB_ADDSTRING, 0, (LPARAM)t);
     MkStatic(G_REC, L"Zielordner", 0, 194, 200, 14, SS_LEFT, g_fSmall, true);
     iRecDir = MkEdit(G_REC, IDC_I_RECDIR, 0, 210, 296, 26, 0, false);
     iRecBrowse = MkBtn(G_REC, L"Ordner wählen…", IDC_I_RECBROWSE, 0, 244, 144, 28);
     iRecOpen = MkBtn(G_REC, L"Ordner öffnen", IDC_I_RECOPEN, 152, 244, 144, 28);
-    MkStatic(G_REC, L"Dateiname: Aufnahme_Datum_Uhrzeit.wav/.flac · nach Stopp liegt genau eine fertige Datei vor", 0, 278, 296, 28, SS_LEFT, g_fSmall, true);
+    MkStatic(G_REC, L"Dateiname: Aufnahme_Datum_Uhrzeit.wav/.flac · ohne Teilung liegt nach Stopp genau eine Datei vor", 0, 278, 296, 28, SS_LEFT, g_fSmall, true);
+    MkBtn(G_REC, L"Studio: Auto-Pegel, HiRes, Mehrspur …", IDC_I_STUDIO, 0, 312, 296, 30);
     // SUM (Summen-Modul)
     iSumMono = MkToggle(G_SUM, L"Mono-Summe am Ausgang (L+R auf beide Kanäle)", IDC_I_SUMMONO, 0, 0, 296, 22);
     MkStatic(G_SUM, L"Quellen per Kabel in den linken Port ziehen. Je Kabel: welcher Kanal der Quelle und wohin im Modul.", 0, 28, 296, 32, SS_LEFT, g_fSmall, true);
@@ -1771,6 +2220,7 @@ static void ShowGroups(bool hasNode, int kind) {
         g_gvis[G_HEAD] = g_gvis[G_LEVEL] = g_gvis[G_INFO] = g_gvis[G_BTN] = true;
         if (kind == K_REC) g_gvis[G_REC] = true;
         else if (kind == K_SUM) { g_gvis[G_SUM] = true; g_gvis[G_DELAY] = true; }
+        else if (kind == K_VOUT) g_gvis[G_TRIM] = true;
         else if (IsSink(kind)) {
             g_gvis[G_SYNC] = g_gvis[G_TRIM] = true;
             if (!g_autoSync) g_gvis[G_DELAY] = g_gvis[G_EXT] = true;
@@ -1940,10 +2390,9 @@ static void FillSumCtl(Node* n) {
 static void FillRecCtl(Node* n) {
     RecCtx* rc = n->rc;
     if (!rc) return;
-    static const int R[4] = {44100, 48000, 88200, 96000};
     int idx = 1;
-    for (int i = 0; i < 4; i++) if (R[i] == rc->rate) idx = i;
-    SendMessageW(iRecFmt, CB_SETCURSEL, rc->flac ? (rc->bits == 16 ? 2 : 1) : (rc->bits == 16 ? 3 : rc->bits == 32 ? 4 : 0), 0);
+    for (int i = 0; i < 8; i++) if (REC_RATES[i] == rc->rate) idx = i;
+    SendMessageW(iRecFmt, CB_SETCURSEL, rc->flac ? (rc->bits == 16 ? 2 : 1) : (rc->bits == 16 ? 3 : rc->bits == 32 ? (rc->int32 ? 5 : 4) : 0), 0);
     SendMessageW(iRecRate, CB_SETCURSEL, idx, 0);
     SetWindowTextW(iRecDir, rc->dir.c_str());
     RefreshRecCtl(n);
@@ -2191,6 +2640,8 @@ static COLORREF KindColor(int k) {
         case K_AIRPLAY: return RGB(255, 120, 190);
         case K_REC: return RGB(240, 70, 80);
         case K_SUM: return RGB(250, 190, 60);
+        case K_VIN: return RGB(120, 140, 255);
+        case K_VOUT: return RGB(150, 110, 255);
         default: return RGB(255, 160, 60);
     }
 }
@@ -2557,6 +3008,88 @@ static void PlaceNodeAuto(Node* n, bool sink) {   // neue Nodes innerhalb der ak
     for (Node* o : g_nodes) if (o != n && IsSink(o->kind) == sink) cnt++;
     n->x = (float)(std::floor((sink ? g_panX + std::max(330.0, vw - NODE_W - 40) : g_panX + 40) / 10.0) * 10.0);
     n->y = (float)(std::floor((g_panY + 30 + (cnt % 4) * (NODE_H + 60.0) + (cnt / 4) * 20.0) / 10.0) * 10.0);
+}
+
+// ======================================================================= Steuerung (gemeinsam fuer Studio-Fenster und Web-App)
+static bool DriverInstalled();
+static bool DriverInstallElevated(std::wstring& msg);
+static bool DriverRemoveElevated(std::wstring& msg);
+static void StudioDlgOpen();
+static bool DriverRun(bool install, std::wstring& msg);
+static void StartDriverJob(bool install);
+static const UINT WM_DRVDONE = WM_APP + 31;
+
+static void ApplyLive(bool on) {   // Live-Modus: Geraete werden mit dem Niedriglatenz-Pfad neu geoeffnet
+    EnterCriticalSection(&g_cs);
+    g_live = on;
+    LiveCtl::Cfg c; c.startMs = (double)g_liveStartMs.load(); g_liveCtl.init(c);
+    if (!g_liveCtl.isAuto()) g_liveCtl.setManual((double)g_liveStartMs.load());
+    for (Node* n : g_nodes) if (n->kind == K_OUT || n->kind == K_CAPTURE) CloseNode(n);
+    LeaveCriticalSection(&g_cs);
+    Log("Live-Modus %s", on ? "an" : "aus");
+}
+static void CtlLive(int on, int autoMode, int ms) {   // -1 = unveraendert
+    if (autoMode >= 0) g_liveCtl.setAuto(autoMode != 0);
+    if (ms >= 2) { g_liveStartMs = std::min(40, ms); g_liveCtl.setManual((double)g_liveStartMs.load()); }
+    if (on >= 0 && (on != 0) != g_live.load()) ApplyLive(on != 0);
+    SaveGraph();
+}
+static std::wstring VNodeName(int kind, int idx, int layout) {
+    const vbus::Layout& L = vbus::GetLayout(layout);
+    if (idx >= 100) { int gi = idx - 100; return std::wstring(L"DAW ") + W8(gi < L.ngroups ? L.g[gi].name : "Gruppe") + L" → Stereo (Downmix)"; }
+    wchar_t b[96]; swprintf(b, 96, kind == K_VIN ? L"DAW-Ausgang %d/%d" : L"DAW-Eingang %d/%d", 2 * idx + 1, 2 * idx + 2); return b;
+}
+static void CtlVBus(int on, int layout) {   // -1 = unveraendert
+    if (layout >= 0 && layout < vbus::NLAYOUTS) {
+        g_vbLayout = layout; if (g_vb) g_vb->layout.store((uint32_t)layout);
+        for (Node* n : g_nodes) if ((n->kind == K_VIN || n->kind == K_VOUT) && n->vbIdx >= 100 && n->vbIdx - 100 >= vbus::GetLayout(layout).ngroups) n->vbIdx = 100;
+        for (Node* n : g_nodes) if (n->kind == K_VIN || n->kind == K_VOUT) n->name = VNodeName(n->kind, n->vbIdx, layout);
+    }
+    if (on >= 0) g_vbWanted = on != 0;
+    if (on >= 0 && !g_running) { if (g_vbWanted.load()) VBusOpen(); else VBusClose(); }
+    SaveGraph(); InvalidateRect(g_canvas, nullptr, FALSE);
+}
+static int CtlAddVirtual(int kind, int which) {   // which: -1 alle 8 Stereo-Paare, 0..7 ein Paar, 99 alle Surround-Downmixe der Vorlage
+    int added = 0; const vbus::Layout& L = vbus::GetLayout(g_vbLayout.load());
+    auto has = [&](int idx) { for (Node* n : g_nodes) if (n->kind == kind && n->vbIdx == idx) return true; return false; };
+    auto add = [&](int idx) { if (has(idx) || g_nodes.size() >= 60) return; Node* n = AddNode(kind, L"vbus", VNodeName(kind, idx, g_vbLayout.load()), 0, 0); n->vbIdx = idx; PlaceNodeAuto(n, IsSink(kind)); added++; };
+    if (which == -1) for (int p = 0; p < 8; p++) add(p);
+    else if (which == 99) { if (kind == K_VIN) for (int g = 0; g < L.ngroups; g++) if (L.g[g].type != vbus::G_STEREO) add(100 + g); }
+    else if ((which >= 0 && which < 8) || (which >= 100 && which < 100 + L.ngroups)) add(which);
+    if (added) { SaveGraph(); InvalidateRect(g_canvas, nullptr, FALSE); }
+    return added;
+}
+static int CtlNodeSet(Node* n, const std::string& key, double v, bool hasN, bool hasB, bool b, std::string& err) {   // 1 ok, 0 unbekannt, -1 Fehler
+    const bool isInt = hasN && v == (double)(int)v; const int iv = (int)v;
+    if (key == "excl") { if (!(n->kind == K_OUT || n->kind == K_CAPTURE)) { err = "Nur für Geräte-Ein- und -Ausgänge"; return -1; } if (!hasB) { err = "Ungültig"; return -1; } n->excl = b; ReopenNode(n); SaveGraph(); return 1; }
+    if (key == "exRate") { if (!(n->kind == K_OUT || n->kind == K_CAPTURE) || !isInt || !(iv == 0 || RecRateOk(iv))) { err = "Ungültig"; return -1; } n->exRate = iv; if (n->excl.load()) ReopenNode(n); SaveGraph(); return 1; }
+    if (key == "inPair") { if (n->kind != K_CAPTURE || !isInt || iv < 0 || iv > 7) { err = "Kanalpaar 1–8 nur bei Eingängen"; return -1; } n->inPair = iv; SaveGraph(); return 1; }
+    if (key == "liveDirect") { if (!(n->kind == K_OUT || n->kind == K_VOUT) || !hasB) { err = "Ungültig"; return -1; } n->liveDirect = b; SaveGraph(); return 1; }
+    if (key == "vbIdx") { if (!(n->kind == K_VIN || n->kind == K_VOUT) || !isInt || !((iv >= 0 && iv < 8) || (iv >= 100 && iv < 108 && n->kind == K_VIN))) { err = "Ungültig"; return -1; } n->vbIdx = iv; n->name = VNodeName(n->kind, iv, g_vbLayout.load()); ReopenNode(n); SaveGraph(); return 1; }
+    return 0;
+}
+static bool CtlRecSet(Node* n, const std::string& key, double v, std::string& err) {
+    RecCtx* rc = n ? n->rc : nullptr; if (!rc) { err = "Keine Aufnahme-Box"; return false; }
+    const int iv = (int)std::lround(v); const bool isInt = v == (double)iv;
+    const bool liveKey = key == "alMode" || key == "alTarget" || key == "alBoost" || key == "alCeil" || key == "alSpeed" || key == "alReset";
+    if (rc->rec.active() && !liveKey) { err = "Während der Aufnahme nicht änderbar"; return false; }
+    auto inList = [&](std::initializer_list<int> l) { for (int x : l) if (x == iv) return true; return false; };
+    if (key == "fmt") { if (!isInt || iv < 0 || iv > 5) { err = "Ungültig"; return false; } if ((iv == 1 || iv == 2) && rc->multitrack) { err = "FLAC kennt nur Stereo – erst Mehrspur ausschalten"; return false; } rc->flac = (iv == 1 || iv == 2); rc->bits = (iv == 2 || iv == 3) ? 16 : (iv == 4 || iv == 5) ? 32 : 24; rc->int32 = (iv == 5); }
+    else if (key == "rate") { if (!isInt || !RecRateOk(iv)) { err = "Ungültige Samplerate"; return false; } rc->rate = iv; n->rate = iv; rc->armSig = 0; ReopenNode(n); }
+    else if (key == "dither") { if (!isInt || iv < -1 || iv > 1) { err = "Ungültig"; return false; } rc->dither = iv; }
+    else if (key == "multitrack") { if (!isInt || iv < 0 || iv > 1) { err = "Ungültig"; return false; } if (iv && rc->flac) { err = "Mehrspur braucht WAV (FLAC kennt nur Stereo)"; return false; } if (iv && rc->bitperfect) { err = "Bit-perfekt gilt nur für eine Stereo-Quelle"; return false; } rc->multitrack = iv; }
+    else if (key == "bitperfect") { if (!isInt || iv < 0 || iv > 1) { err = "Ungültig"; return false; } if (iv && rc->multitrack) { err = "Bit-perfekt gilt nur für eine Stereo-Quelle – erst Mehrspur ausschalten"; return false; } rc->bitperfect = iv != 0; rc->bpSync = false; }
+    else if (key == "preRoll") { if (!isInt || !inList({0, 2, 5, 10, 30})) { err = "Vorlauf: 0, 2, 5, 10 oder 30 s"; return false; } rc->preRoll = iv; rc->armSig = 0; }
+    else if (key == "splitMin") { if (!isInt || !inList({0, 10, 30, 60, 120})) { err = "Teilung: aus, 10, 30, 60 oder 120 min"; return false; } rc->splitMin = iv; }
+    else if (key == "alMode") { if (!isInt || iv < 0 || iv > 2) { err = "Ungültig"; return false; } rc->alp.mode = iv; }
+    else if (key == "alTarget") { if (!isInt || iv < -30 || iv > -10) { err = "Ziel −30 … −10 LUFS"; return false; } rc->alp.targetLufs = iv; }
+    else if (key == "alBoost") { if (!isInt || iv < 0 || iv > 36) { err = "Anhebung 0 … 36 dB"; return false; } rc->alp.maxBoostDb = iv; }
+    else if (key == "alCeil") { if (v < -12.0 || v > 0.0 || std::fabs(v * 2 - std::round(v * 2)) > 1e-9) { err = "Decke −12 … 0 dBTP (0,5er-Schritte)"; return false; } rc->alp.ceilingDb = v; }
+    else if (key == "alSpeed") { if (!isInt || iv < 0 || iv > 2) { err = "Ungültig"; return false; } rc->alp.speed = iv; }
+    else if (key == "alReset") { rc->al.resetPeaks(); return true; }
+    else { err = "Einstellung unbekannt"; return false; }
+    rc->al.set(rc->alp); SaveGraph(); if (g_sel == n) UpdateInspector(); InvalidateRect(g_canvas, nullptr, FALSE);
+    return true;
 }
 
 static bool InRect(POINT p, int x, int y, int w, int h);
@@ -2972,6 +3505,8 @@ static void BuildToolbar() {
     g_btnWeb = MkMain(L"BARBtn", L"Web-Interface…", WS_TABSTOP, IDC_BTN_WEB, g_fUI);
     g_btnMore = MkMain(L"BARBtn", L"⋯", WS_TABSTOP, IDC_BTN_MORE, g_fUI);
     g_btnBg = MkMain(L"BARBtn", L"Hintergrund…", WS_TABSTOP, IDC_BTN_BG, g_fUI);
+    g_btnStudio = MkMain(L"BARBtn", L"Studio…", WS_TABSTOP, IDC_BTN_STUDIO, g_fBold);
+    SendMessageW(g_btnStudio, BTM_SETFLAGS, BTN_ACCENT, 0);
     g_btnLayout = MkMain(L"BARBtn", L"Layouts", WS_TABSTOP, IDC_BTN_LAYOUT, g_fUI);
     g_btnAbout = MkMain(L"BARBtn", L"Info", WS_TABSTOP, IDC_BTN_ABOUT, g_fUI);
     g_btnTheme = MkMain(L"BARBtn", L"Design", WS_TABSTOP, IDC_BTN_THEME, g_fUI);
@@ -3019,7 +3554,7 @@ static void SyncToolbarFromSettings() {
 
 static std::vector<HWND> g_tbHidden;
 static void ArrangeOverflow(int rx) {   // Schmales Fenster: Schaltflaechen, die nicht mehr passen, wandern ins Menue "⋯"
-    HWND cand[] = {g_btnVirt, g_btnSyncNow, g_btnRescan, g_btnRec, g_btnSum, g_btnWeb, g_btnBg}; HWND right[] = {g_btnLayout, g_btnTheme, g_btnAbout}; g_tbHidden.clear();
+    HWND cand[] = {g_btnVirt, g_btnSyncNow, g_btnRescan, g_btnRec, g_btnSum, g_btnWeb, g_btnBg, g_btnStudio}; HWND right[] = {g_btnLayout, g_btnTheme, g_btnAbout}; g_tbHidden.clear();
     auto rect = [&](HWND h) { RECT r; GetWindowRect(h, &r); MapWindowPoints(nullptr, g_hwnd, (POINT*)&r, 2); r.left = MulDiv(r.left, 96, g_dpi); r.right = MulDiv(r.right, 96, g_dpi); r.top = MulDiv(r.top, 96, g_dpi); return r; };
     int lim[2] = {rx - 14, rx - 14}; for (HWND h : right) lim[0] = std::min(lim[0], (int)rect(h).left - 8);
     auto over = [&](int slack) { bool any = false; for (HWND h : cand) { RECT r = rect(h); int row = r.top > 50 ? 1 : 0; if (r.right > lim[row] - slack) any = true; } return any; };
@@ -3048,6 +3583,7 @@ static void LayoutMain(int w, int h) {
     Place(g_btnSum, 998, 68, 156, 30);
     Place(g_btnWeb, 1162, 68, 160, 30);
     Place(g_btnBg, 1330, 68, 150, 30);
+    Place(g_btnStudio, 1488, 68, 130, 30);
     int rx = MulDiv(cw, 96, g_dpi);
     Place(g_btnAbout, rx - 14 - 64, 12, 64, 32);
     Place(g_btnTheme, rx - 14 - 64 - 8 - 96, 12, 96, 32);
@@ -3383,7 +3919,7 @@ static std::atomic<bool> g_webQuit{false};
 static int g_webPort = 8443;
 struct WebReq { int kind = 0; web::JObj cmd; std::string err, out; bool ok = false; };   // kind 0 = Befehl, 1 = Zustand abfragen (laeuft immer im UI-Thread)
 
-static const char* WebKind(int k) { switch (k) { case K_LOOP: return "loop"; case K_CAPTURE: return "cap"; case K_GEN: return "gen"; case K_AIRPLAY: return "air"; case K_OUT: return "out"; case K_STREAM: return "stream"; case K_REC: return "rec"; default: return "sum"; } }
+static const char* WebKind(int k) { switch (k) { case K_LOOP: return "loop"; case K_CAPTURE: return "cap"; case K_GEN: return "gen"; case K_AIRPLAY: return "air"; case K_OUT: return "out"; case K_STREAM: return "stream"; case K_REC: return "rec"; case K_VIN: return "vin"; case K_VOUT: return "vout"; default: return "sum"; } }
 static std::string WebF(double v) { char b[40]; snprintf(b, sizeof b, "%.1f", v); return b; }
 static std::string WebB(bool v) { return v ? "true" : "false"; }
 static std::string WebStatus(Node* n) {
@@ -3401,19 +3937,37 @@ static void TrayUpdate();
 static std::string WebProps(Node* n) {   // kindspezifische Einstellungen fuer die Fernbedienung
     char b[520];
     if (n->kind == K_GEN) { snprintf(b, sizeof b, ",\"p\":{\"gen\":%d}", std::max(0, std::min(2, n->genType))); return b; }
-    if (n->kind == K_REC && n->rc) { RecCtx* rc = n->rc; int f = rc->flac ? (rc->bits == 16 ? 2 : 1) : (rc->bits == 16 ? 3 : rc->bits == 32 ? 4 : 0); snprintf(b, sizeof b, ",\"p\":{\"fmt\":%d,\"rate\":%d,\"dir\":", f, (int)rc->rate); return b + web::JStr(U8(rc->dir)) + "}"; }
+    if (n->kind == K_REC && n->rc) { RecCtx* rc = n->rc; char q[420];
+        snprintf(q, sizeof q, ",\"p\":{\"fmt\":%d,\"rate\":%d,\"dither\":%d,\"mt\":%d,\"bp\":%s,\"pre\":%.0f,\"split\":%.0f,\"al\":{\"mode\":%d,\"target\":%.0f,\"boost\":%.0f,\"ceil\":%.1f,\"speed\":%d},\"dir\":", RecFmtIndex(rc), (int)rc->rate, rc->dither, rc->multitrack, WebB(rc->bitperfect).c_str(), rc->preRoll, rc->splitMin, rc->alp.mode, rc->alp.targetLufs, rc->alp.maxBoostDb, rc->alp.ceilingDb, rc->alp.speed);
+        return q + web::JStr(U8(rc->dir)) + "}"; }
     if (n->kind == K_STREAM && n->st) { StreamCtx* s = n->st;
         snprintf(b, sizeof b, ",\"p\":{\"port\":%d,\"scheme\":%d,\"rate\":%d,\"burst\":%d,\"fmt\":%d,\"volCtl\":%s,\"dither\":%s,\"autoLat\":%s,\"vol\":%d,\"play\":%s,\"ctl\":%d,\"ip\":", (int)s->port, (int)s->scheme, (int)s->rate, (int)s->burstMs, (int)s->format == 1 ? 0 : 1, WebB((bool)s->volCtl).c_str(), WebB((bool)s->dither).c_str(), WebB((bool)s->autoLat).c_str(), (int)s->sonosVol, WebB((bool)s->playWanted).c_str(), (int)s->ctl);
         std::string o = b + web::JStr(s->ip) + ",\"room\":" + web::JStr(U8(s->room)) + ",\"group\":["; EnterCriticalSection(&s->cs);
         for (size_t i = 0; i < s->groupIps.size(); i++) o += std::string(i ? "," : "") + "{\"ip\":" + web::JStr(s->groupIps[i]) + ",\"name\":" + web::JStr(U8(i < s->groupNames.size() ? s->groupNames[i] : std::wstring())) + "}";
         LeaveCriticalSection(&s->cs); return o + "]}"; }
     if (n->kind == K_AIRPLAY && n->ap) { AirplayCtx* a = n->ap; snprintf(b, sizeof b, ",\"p\":{\"port\":%d,\"buf\":%d,\"latAuto\":%s,\"latMs\":%d,\"useVol\":%s,\"name\":", (int)a->port, (int)a->bufferMs, WebB((bool)a->latAuto).c_str(), (int)a->latManualMs, WebB((bool)a->useVol).c_str()); return b + web::JStr(U8(a->name)) + "}"; }
+    if (n->kind == K_OUT || n->kind == K_CAPTURE || n->kind == K_LOOP) {
+        snprintf(b, sizeof b, ",\"p\":{\"excl\":%s,\"exRate\":%d,\"pair\":%d,\"liveDirect\":%s,\"mode\":\"%s\",\"per\":%.1f,\"lat\":%.1f}", WebB(n->excl.load()).c_str(), n->exRate, n->inPair.load(), WebB(n->liveDirect.load()).c_str(), n->exclActive ? "excl" : n->lowLat ? "low" : "std", n->devPeriodMs, n->streamLatMs.load());
+        return b; }
+    if (n->kind == K_VIN || n->kind == K_VOUT) { snprintf(b, sizeof b, ",\"p\":{\"idx\":%d,\"liveDirect\":%s}", n->vbIdx, WebB(n->liveDirect.load()).c_str()); return b; }
     return "";
+}
+static std::string WebLive() {
+    char b[400]; snprintf(b, sizeof b, "{\"on\":%s,\"auto\":%s,\"ms\":%d,\"lag\":%.1f,\"raises\":%u,\"under\":%u,\"resync\":%u,\"opts\":[2,3,4,6,8,12,16,24,32,40]}", WebB(g_live.load()).c_str(), WebB(g_liveCtl.isAuto()).c_str(), g_liveStartMs.load(), g_liveCtl.lagMs(), (unsigned)g_liveCtl.raises(), (unsigned)g_underruns.load(), (unsigned)g_resyncs.load());
+    return b;
+}
+static std::string WebVBus() {
+    int ly = g_vbLayout.load(); const vbus::Layout& L = vbus::GetLayout(ly);
+    bool drv = g_vb && g_vb->driverOn.load() && vbus::Fresh(g_vb->driverBeatNs.load(), vbus_win::NowNs());
+    char b[300]; snprintf(b, sizeof b, "{\"on\":%s,\"open\":%s,\"layout\":%d,\"installed\":%s,\"daw\":%s,\"rate\":%d,\"buf\":%u,\"layouts\":[", WebB(g_vbWanted.load()).c_str(), WebB(g_vb != nullptr).c_str(), ly, WebB(DriverInstalled()).c_str(), WebB(drv).c_str(), g_vb ? (int)g_vb->rate.load() : 0, g_vb ? (unsigned)g_vb->bufFrames.load() : 0u);
+    std::string o = b; for (int i = 0; i < vbus::NLAYOUTS; i++) o += std::string(i ? "," : "") + web::JStr(vbus::GetLayout(i).title);
+    o += "],\"groups\":["; for (int g = 0; g < L.ngroups; g++) o += std::string(g ? "," : "") + "{\"first\":" + std::to_string(L.g[g].first) + ",\"count\":" + std::to_string(L.g[g].count) + ",\"type\":" + std::to_string(L.g[g].type) + ",\"name\":" + web::JStr(L.g[g].name) + "}";
+    o += "],\"channels\":["; for (int c = 0; c < vbus::CH; c++) o += std::string(c ? "," : "") + web::JStr(vbus::ChannelName(ly, c)); return o + "]}";
 }
 static std::string WebGlobal() {
     std::string o = "\"engine\":{\"running\":" + WebB(g_running) + "},\"global\":{\"pad\":" + std::to_string((int)g_padMs) + ",\"base\":" + std::to_string((int)g_baseMs) + ",\"poll\":" + std::to_string((int)g_pollMs) + ",\"drv\":" + std::to_string((int)g_drvMs) + ",\"opts\":{\"pad\":[10,20,30,50,100],\"base\":[10,20,30,50,100,200,500],\"poll\":[1,2,3,5],\"drv\":[20,50,100,200]}},\"sonosFound\":[";
     EnterCriticalSection(&g_sonosCs); for (size_t i = 0; i < g_sonos.size(); i++) o += std::string(i ? "," : "") + "{\"ip\":" + web::JStr(g_sonos[i].ip) + ",\"name\":" + web::JStr(U8(g_sonos[i].name)) + ",\"model\":" + web::JStr(U8(g_sonos[i].model)) + "}"; LeaveCriticalSection(&g_sonosCs);
-    return o + "],\"msg\":" + web::JStr(U8(g_msg));
+    return o + "],\"live\":" + WebLive() + ",\"vbus\":" + WebVBus() + ",\"msg\":" + web::JStr(U8(g_msg));
 }
 static bool WebSonosFind(const std::string& ip, SonosDev& d) { bool ok = false; EnterCriticalSection(&g_sonosCs); for (auto& x : g_sonos) if (x.ip == ip) { d = x; ok = true; break; } LeaveCriticalSection(&g_sonosCs); return ok; }
 static std::string WebHw() {
@@ -3457,7 +4011,9 @@ static void WebBuildState(std::string& o) {   // UI-Thread: Node-/Kabel-Listen w
             }
             o += "]";
         }
-        if (n->kind == K_REC && n->rc) { RecCtx* rc = n->rc; char b[160]; snprintf(b, sizeof b, ",\"rec\":{\"on\":%s,\"sec\":%.1f,\"bytes\":%.0f,\"fmt\":", WebB(rc->rec.active()).c_str(), (double)rc->rec.frames() / std::max(1, rc->rate), (double)rc->rec.bytes()); o += b + web::JStr(U8(std::wstring(RecFmtName(rc->bits, rc->flac)) + L" · " + std::to_wstring(rc->rate) + L" Hz")) + "}"; }
+        if (n->kind == K_REC && n->rc) { RecCtx* rc = n->rc; char b[520];
+            snprintf(b, sizeof b, ",\"rec\":{\"on\":%s,\"sec\":%.1f,\"bytes\":%.0f,\"parts\":%u,\"ch\":%d,\"lufs\":%.1f,\"tp\":%.1f,\"gain\":%.1f,\"gr\":%.1f,\"clips\":%u,\"ring\":%.2f,\"pre\":%.1f,\"fmt\":", WebB(rc->rec.active()).c_str(), (double)rc->rec.frames() / std::max(1, rc->rate), (double)rc->rec.bytes(), (unsigned)rc->rec.parts(), rc->curCh, (double)rc->al.shortLufs(), (double)rc->al.truePeakDb(), (double)rc->al.gainDb(), (double)rc->al.limiterDb(), (unsigned)rc->al.clips(), rc->rec.ringFill(), rc->rec.armedSeconds());
+            o += b + web::JStr(U8(RecFmtFull(rc) + L" · " + std::to_wstring(rc->rate) + L" Hz")) + "}"; }
         o += "}";
     }
     o += "],\"conns\":["; f = true;
@@ -3493,7 +4049,9 @@ static bool WebExecUi(WebReq& r) {   // laeuft im UI-Thread; prueft ALLE Regeln 
     if (op == "trim") { Node* n = WebNode(c, "node"); double ms; if (!n || !IsOutSink(n->kind) || !web::GetNum(c, "ms", ms) || ms < -500 || ms > 500) return bad("Ungültig"); n->trimMs = std::floor(ms * 10.0 + 0.5) / 10.0; if (g_sel == n) UpdateInspector(); InvalidateRect(g_canvas, nullptr, FALSE); WebSaveLater(); return true; }
     if (op == "delay") { Node* n = WebNode(c, "node"); double ms; if (!n || n->kind == K_REC || n->kind == K_SUM || !web::GetNum(c, "ms", ms) || ms < 0 || ms > 2000) return bad("Ungültig"); if (IsOutSink(n->kind) && g_autoSync) return bad("Autopilot ist an – bitte Feinkorrektur (Trim) nutzen");
         n->delayMs = std::floor(ms * 10.0 + 0.5) / 10.0; if (g_sel == n) UpdateInspector(); InvalidateRect(g_canvas, nullptr, FALSE); WebSaveLater(); return true; }
-    if (op == "addNode") { if (g_nodes.size() >= 40) return bad("Zu viele Nodes"); std::string kd, dev; if (!web::GetStr(c, "kind", kd)) return bad("Ungültig"); web::GetStr(c, "dev", dev); Node* n = nullptr; std::wstring wd = W8(dev);
+    if (op == "addNode") { if (g_nodes.size() >= 60) return bad("Zu viele Nodes"); std::string kd, dev; if (!web::GetStr(c, "kind", kd)) return bad("Ungültig"); web::GetStr(c, "dev", dev); Node* n = nullptr; std::wstring wd = W8(dev);
+        if (kd == "vin" || kd == "vout") { int which = -1; if (!dev.empty() && dev != "all") { which = atoi(dev.c_str()); if (dev == "down") which = 99; if (!(which == 99 || (which >= 0 && which < 8) || (which >= 100 && which < 108))) return bad("Ungültiger Kanal"); }
+            if (!g_vbWanted) CtlVBus(1, -1); int added = CtlAddVirtual(kd == "vin" ? K_VIN : K_VOUT, which); if (!added) return bad("Schon vorhanden"); return true; }
         if (kd == "cap") { for (auto& d : g_captureDevs) if (d.id == wd) n = AddNode(K_CAPTURE, d.id, L"Eingang: " + d.name, 0, 0); } else if (kd == "loop") { for (auto& d : g_renderDevs) if (d.id == wd) n = AddNode(K_LOOP, d.id, L"Mitschnitt: " + d.name, 0, 0); }
         else if (kd == "out") { for (auto& d : g_renderDevs) if (d.id == wd) n = AddNode(K_OUT, d.id, d.name, 0, 0); }
         else if (kd == "gen") { if (dev == "click") n = AddNode(K_GEN, L"gen:click", L"Test: Klick (1 Hz)", 0, 0); else if (dev == "sine") n = AddNode(K_GEN, L"gen:sine", L"Test: Sinus 1 kHz", 0, 0); else if (dev == "pink") n = AddNode(K_GEN, L"gen:pink", L"Test: Rosa Rauschen", 0, 0); }
@@ -3506,12 +4064,19 @@ static bool WebExecUi(WebReq& r) {   // laeuft im UI-Thread; prueft ALLE Regeln 
     if (op == "calibrate") { if (!g_running) return bad("Erst „Start“ drücken"); if (g_calibActive.load()) return bad("Einmessung läuft bereits"); Node* m = WebRemoteMic(); if (!m || NowSec() - m->remLast > 2.0) return bad("Handy-Mikrofon liefert keine Daten"); StartCalibration(); return true; }
     auto closeRun = [&](Node* x) { if (g_running) { EnterCriticalSection(&g_cs); CloseNode(x); LeaveCriticalSection(&g_cs); } };
     auto isIp = [&](const std::string& t) { unsigned a, b2, c2, d2; char x; return sscanf(t.c_str(), "%u.%u.%u.%u%c", &a, &b2, &c2, &d2, &x) == 4 && a < 256 && b2 < 256 && c2 < 256 && d2 < 256; };
+    if (op == "live") { bool on = false, a = false; double ms = -1; bool hasOn = web::GetBool(c, "on", on), hasA = web::GetBool(c, "auto", a), hasMs = web::GetNum(c, "ms", ms);
+        if (!hasOn && !hasA && !hasMs) return bad("Ungültig"); if (hasMs && (ms != (int)ms || ms < 2 || ms > 40)) return bad("Puffer 2–40 ms");
+        CtlLive(hasOn ? (on ? 1 : 0) : -1, hasA ? (a ? 1 : 0) : -1, hasMs ? (int)ms : -1); return true; }
+    if (op == "vbus") { bool on = false; double ly = -1; bool hasOn = web::GetBool(c, "on", on), hasLy = web::GetNum(c, "layout", ly);
+        if (!hasOn && !hasLy) return bad("Ungültig"); if (hasLy && (ly != (int)ly || ly < 0 || ly >= vbus::NLAYOUTS)) return bad("Ungültige Surround-Zuordnung");
+        CtlVBus(hasOn ? (on ? 1 : 0) : -1, hasLy ? (int)ly : -1); return true; }
     if (op == "engine") { bool on; if (!web::GetBool(c, "on", on)) return bad("Ungültig"); if (on != g_running) HandleCommand(IDC_BTN_START, BN_CLICKED, nullptr); return true; }
     if (op == "act") { std::string a; if (!web::GetStr(c, "name", a)) return bad("Ungültig");
         if (a == "rescan") { HandleCommand(IDC_BTN_RESCAN, BN_CLICKED, nullptr); return true; }
         if (a == "sonosSearch") { StartDiscovery(); g_msg = L"Suche nach Sonos-Geräten …"; return true; }
         if (a == "calibrateLocal") { if (!g_running) return bad("Erst „Start“ drücken"); if (g_calibActive.load()) return bad("Einmessung läuft bereits"); if (!PickMic()) return bad("Kein Mikrofon – erst einen Eingang (Mikrofon) hinzufügen"); StartCalibration(); return true; }
         if (a == "vdevSetup") { SetupVirtual(); return true; } if (a == "vdevRestore") { RestoreDefaultRender(true); return true; }
+        if (a == "driverInstall" || a == "driverRemove") { StartDriverJob(a == "driverInstall"); g_msg = L"Treiber: Bitte am PC die Windows-Abfrage (Administrator) bestätigen …"; return true; }
         return bad("Unbekannte Aktion"); }
     if (op == "global") { std::string k; double v; if (!web::GetStr(c, "key", k) || !web::GetNum(c, "value", v) || v != (int)v) return bad("Ungültig"); int iv = (int)v;
         auto pick = [&](const int* a, int cnt, HWND cmb, int& dst) { for (int i = 0; i < cnt; i++) if (a[i] == iv) { dst = a[i]; SendMessageW(cmb, CB_SETCURSEL, i, 0); SaveGraph(); return true; } return false; }; int tmp = 0;
@@ -3530,6 +4095,8 @@ static bool WebExecUi(WebReq& r) {   // laeuft im UI-Thread; prueft ALLE Regeln 
     if (op == "groupClear") { Node* n = WebNode(c, "node"); if (!n || n->kind != K_STREAM || !n->st) return bad("Ungültig"); EnterCriticalSection(&n->st->cs); n->st->groupIps.clear(); n->st->groupNames.clear(); n->st->groupVol.clear(); n->st->groupWant.clear(); LeaveCriticalSection(&n->st->cs); n->st->groupDirty = true; UpdateGroupList(); SaveGraph(); return true; }
     if (op == "setProp") { Node* n = WebNode(c, "node"); std::string key, sv; double v = 0; bool b = false; if (!n || !web::GetStr(c, "key", key)) return bad("Ungültig");
         bool hasN = web::GetNum(c, "value", v), hasB = web::GetBool(c, "value", b), hasS = web::GetStr(c, "value", sv); int iv = (int)v; bool isInt = hasN && v == iv;
+        { std::string e; int r2 = CtlNodeSet(n, key, v, hasN, hasB, b, e); if (r2 < 0) return bad(e.c_str()); if (r2 > 0) return true; }
+        if (n->kind == K_REC && n->rc && key != "dir") { std::string e; if (!hasN && !hasB && key != "alReset") return bad("Ungültig"); if (!CtlRecSet(n, key, hasN ? v : hasB ? (b ? 1.0 : 0.0) : 0.0, e)) return bad(e.c_str()); return true; }
         if (key == "ext") { if (!IsOutSink(n->kind) || !hasN || v < 0 || v > 10000) return bad("Ungültig"); n->extMs = v; if (g_sel == n) UpdateInspector(); WebSaveLater(); return true; }
         if (n->kind == K_GEN && key == "gen") { if (!isInt || iv < 0 || iv > 2) return bad("Ungültig"); n->genType = iv; const wchar_t* ids[] = {L"gen:click", L"gen:sine", L"gen:pink"}; const wchar_t* nm[] = {L"Test: Klick (1 Hz)", L"Test: Sinus 1 kHz", L"Test: Rosa Rauschen"}; n->devId = ids[iv]; n->name = nm[iv]; UpdateInspector(); SaveGraph(); return true; }
         if (n->kind == K_REC && n->rc) { RecCtx* rc = n->rc; if (rc->rec.active() && key != "dir") return bad("Während der Aufnahme nicht änderbar");
@@ -3659,6 +4226,206 @@ static void WebDlgOpen() {
     BOOL d = TH.dark; DwmSetWindowAttribute(g_webDlg, 20, &d, sizeof d);
 }
 
+
+// ======================================================================= Studio-Fenster: Live, Aufnahme-Box (HiRes, Auto-Pegel), virtuelle Eingaenge, Treiber
+// ---- Treiber (Platzhalter bis zum Treiber-Abschnitt)
+// DRIVER-ABSCHNITT
+// ---- ASIO-Treiber "Bens Virtual Bus": in der EXE eingebettet (Ressource 101), Installation/Entfernung per Administrator-Abfrage (nur dafuer)
+static std::wstring DriverDir() { wchar_t p[MAX_PATH] = {}; GetEnvironmentVariableW(L"ProgramData", p, MAX_PATH); return std::wstring(p[0] ? p : L"C:\\ProgramData") + L"\\BensAudioRouter"; }
+static std::wstring DriverFile() { return DriverDir() + L"\\BensAsioBridge.dll"; }
+static bool IsElevated() { HANDLE t; if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) return false; TOKEN_ELEVATION e = {}; DWORD n = 0; bool r = GetTokenInformation(t, TokenElevation, &e, sizeof e, &n) && e.TokenIsElevated; CloseHandle(t); return r; }
+static bool DriverInstalled() {
+    HKEY k; bool ok = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\ASIO\\Bens Virtual Bus", 0, KEY_READ | KEY_WOW64_64KEY, &k) == ERROR_SUCCESS; if (ok) RegCloseKey(k);
+    return ok && GetFileAttributesW(DriverFile().c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+static bool DriverExtract(const std::wstring& path) {
+    HRSRC r = FindResourceW(nullptr, MAKEINTRESOURCEW(101), RT_RCDATA); if (!r) return false;
+    HGLOBAL g = LoadResource(nullptr, r); DWORD sz = SizeofResource(nullptr, r); const void* p = g ? LockResource(g) : nullptr; if (!p || !sz) return false;
+    CreateDirectoryW(DriverDir().c_str(), nullptr);
+    std::wstring tmp = path + L".new"; HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD w = 0; bool ok = WriteFile(f, p, sz, &w, nullptr) && w == sz; CloseHandle(f);
+    if (!ok) { DeleteFileW(tmp.c_str()); return false; }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(tmp.c_str()); return false; }   // scheitert, solange eine DAW die DLL geladen hat
+    return true;
+}
+// Kommandozeilen-Modus der EXE (laeuft mit Administratorrechten): 0 ok, 1 Datei, 2 Registrierung, 3 kein Administrator
+static int DriverCli(bool install) {
+    if (!IsElevated()) return 3;
+    typedef HRESULT(WINAPI * FN)(); const std::wstring f = DriverFile();
+    if (install) { if (!DriverExtract(f)) return 1; HMODULE m = LoadLibraryW(f.c_str()); if (!m) return 2; FN reg = (FN)GetProcAddress(m, "DllRegisterServer"); bool ok = reg && SUCCEEDED(reg()); FreeLibrary(m); return ok ? 0 : 2; }
+    HMODULE m = LoadLibraryW(f.c_str()); if (m) { FN un = (FN)GetProcAddress(m, "DllUnregisterServer"); if (un) un(); FreeLibrary(m); }
+    RegDeleteKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\ASIO\\Bens Virtual Bus", KEY_WOW64_64KEY, 0);   // falls die DLL fehlte
+    if (GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES && !DeleteFileW(f.c_str())) MoveFileExW(f.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    return 0;
+}
+static bool DriverRun(bool install, std::wstring& msg) {
+    DWORD code = 99;
+    if (IsElevated()) code = (DWORD)DriverCli(install);
+    else {
+        wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        SHELLEXECUTEINFOW e = {}; e.cbSize = sizeof e; e.fMask = SEE_MASK_NOCLOSEPROCESS; e.lpVerb = L"runas"; e.lpFile = exe; e.lpParameters = install ? L"--driver-install" : L"--driver-remove"; e.nShow = SW_HIDE;
+        if (!ShellExecuteExW(&e)) { msg = L"Abgebrochen: Für Installation und Entfernung des Treibers ist einmalig die Administrator-Bestätigung von Windows nötig."; return false; }
+        WaitForSingleObject(e.hProcess, 60000); GetExitCodeProcess(e.hProcess, &code); CloseHandle(e.hProcess);
+    }
+    if (code == 0) { msg = install ? L"ASIO-Treiber „Bens Virtual Bus“ ist installiert.\n\nIn der DAW (Ableton, Reaper, Cubase …) unter Audio-Einstellungen den ASIO-Treiber „Bens Virtual Bus“ wählen. Eine bereits laufende DAW bitte neu starten.\nIm Router: Studio → Brücke einschalten und virtuelle Eingänge/Ausgänge anlegen." : L"ASIO-Treiber wurde entfernt.\n\nWar er in einer DAW geladen, verschwindet die Datei nach dem Schließen der DAW bzw. beim nächsten Windows-Start."; return true; }
+    msg = code == 1 ? L"Die Treiberdatei konnte nicht geschrieben werden. Läuft noch eine DAW mit dem Treiber? Bitte schließen und erneut versuchen." : code == 2 ? L"Die Registrierung des Treibers in Windows ist fehlgeschlagen." : L"Keine Administratorrechte.";
+    return false;
+}
+struct DrvJob { bool install; };
+static DWORD WINAPI DrvThread(LPVOID p) { DrvJob* j = (DrvJob*)p; std::wstring* m = new std::wstring; DriverRun(j->install, *m); delete j; PostMessageW(g_hwnd, WM_DRVDONE, 0, (LPARAM)m); return 0; }
+static void StartDriverJob(bool install) { DrvJob* j = new DrvJob{install}; HANDLE h = CreateThread(nullptr, 0, DrvThread, j, 0, nullptr); if (h) CloseHandle(h); else delete j; }
+static bool DriverInstallElevated(std::wstring& msg) { return DriverRun(true, msg); }
+static bool DriverRemoveElevated(std::wstring& msg) { return DriverRun(false, msg); }
+enum {
+    IDS_LIVE = 7001, IDS_LAUTO, IDS_LMS, IDS_LSTAT, IDS_NEXCL, IDS_NLIVE, IDS_NRATE, IDS_NPAIR, IDS_NHINT,
+    IDS_RFMT, IDS_RRATE, IDS_RDITH, IDS_RMT, IDS_RBP, IDS_RPRE, IDS_RSPLIT, IDS_AMODE, IDS_ATARGET, IDS_ABOOST, IDS_ACEIL, IDS_ASPEED, IDS_RSTAT, IDS_RRESET, IDS_RHINT,
+    IDS_VON, IDS_VLAYOUT, IDS_VIN, IDS_VOUT, IDS_VDOWN, IDS_VSTAT, IDS_VDRVI, IDS_VDRVR
+};
+static HWND g_studioDlg = nullptr;
+static const int ST_MS[] = {2, 3, 4, 6, 8, 12, 16, 24, 32, 40};
+static const int ST_PRE[] = {0, 2, 5, 10, 30};
+static const int ST_SPLIT[] = {0, 10, 30, 60, 120};
+static const int ST_TARGET[] = {-23, -20, -18, -16, -14, -12};
+static const int ST_BOOST[] = {0, 6, 12, 18, 24, 30};
+static const double ST_CEIL[] = {-6, -3, -2, -1, -0.5, 0};
+static const int ST_XRATE[] = {0, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000};
+static int StIdx(const int* a, int n, int v) { int best = 0; for (int i = 0; i < n; i++) if (std::abs(a[i] - v) < std::abs(a[best] - v)) best = i; return best; }
+static Node* StudioRecNode() { if (g_sel && g_sel->kind == K_REC) return g_sel; for (Node* n : g_nodes) if (n->kind == K_REC) return n; return nullptr; }
+static void StSel(HWND c, int idx) { if (c && SendMessageW(c, CB_GETCURSEL, 0, 0) != idx && GetFocus() != c) SendMessageW(c, CB_SETCURSEL, idx, 0); }
+static void StTog(HWND c, bool on) { if (c && (SendMessageW(c, TGM_GET, 0, 0) != 0) != on) SendMessageW(c, TGM_SET, on ? 1 : 0, 0); }
+static void StudioRefresh(HWND h) {
+    auto C = [&](int id) { return GetDlgItem(h, id); }; wchar_t b[400];
+    StTog(C(IDS_LIVE), g_live.load()); StTog(C(IDS_LAUTO), g_liveCtl.isAuto()); StSel(C(IDS_LMS), StIdx(ST_MS, 10, g_liveStartMs.load()));
+    EnableWindow(C(IDS_LMS), TRUE);
+    std::wstring ls;
+    if (g_live.load()) {
+        swprintf(b, 400, L"Live aktiv · Router-Puffer jetzt %.1f ms%ls · Aussetzer %u · Neu-Synchronisierungen %u", g_liveCtl.lagMs(), g_liveCtl.isAuto() ? L" (automatisch)" : L" (fest)", (unsigned)g_underruns.load(), (unsigned)g_resyncs.load()); ls = b;
+        double inMs = 0; for (Node* n : g_nodes) if ((n->kind == K_CAPTURE || n->kind == K_VIN) && n->state.load() == 1) inMs = std::max(inMs, n->devPeriodMs + n->streamLatMs.load());
+        int shown = 0;
+        for (Node* n : g_nodes) if (n->kind == K_OUT && n->state.load() == 1 && shown < 4) { shown++;
+            double outMs = std::max(2.5, n->devPeriodMs * 1.6 + 0.5) + n->streamLatMs.load();
+            swprintf(b, 400, L"\r\n%ls: %ls · ≈ %.0f ms Eingang→Ausgang (Schätzung)", n->name.c_str(), n->exclActive ? L"Exklusiv" : n->lowLat ? L"Low-Latency" : L"Standard (kein Niedriglatenz-Pfad)", inMs + g_liveCtl.lagMs() + outMs); ls += b; }
+    } else ls = L"Live aus. Mit Live bekommen Eingänge → Ausgänge die kleinstmögliche Latenz (z. B. DJ-Mixer-Fader am Xone ohne spürbare Verzögerung).";
+    SetWindowTextW(C(IDS_LSTAT), ls.c_str());
+    Node* nd = g_sel; bool devSel = nd && (nd->kind == K_OUT || nd->kind == K_CAPTURE);
+    SetWindowTextW(C(IDS_NHINT), nd ? nd->name.c_str() : L"– im Graph einen Eingang oder Ausgang anklicken –");
+    EnableWindow(C(IDS_NEXCL), devSel); EnableWindow(C(IDS_NRATE), devSel); EnableWindow(C(IDS_NPAIR), nd && nd->kind == K_CAPTURE); EnableWindow(C(IDS_NLIVE), nd && (nd->kind == K_OUT || nd->kind == K_VOUT));
+    if (nd) { StTog(C(IDS_NEXCL), nd->excl.load()); StTog(C(IDS_NLIVE), nd->liveDirect.load()); StSel(C(IDS_NRATE), StIdx(ST_XRATE, 9, nd->exRate)); StSel(C(IDS_NPAIR), nd->inPair.load()); }
+    Node* r = StudioRecNode(); bool rr = r && r->rc; bool act = rr && r->rc->rec.active();
+    for (int id : {IDS_RFMT, IDS_RRATE, IDS_RDITH, IDS_RMT, IDS_RBP, IDS_RPRE, IDS_RSPLIT}) EnableWindow(C(id), rr && !act);
+    for (int id : {IDS_AMODE, IDS_ATARGET, IDS_ABOOST, IDS_ACEIL, IDS_ASPEED, IDS_RRESET}) EnableWindow(C(id), rr);
+    if (rr) { RecCtx* rc = r->rc;
+        StSel(C(IDS_RFMT), RecFmtIndex(rc)); int ri = 1; for (int i = 0; i < 8; i++) if (REC_RATES[i] == rc->rate) ri = i; StSel(C(IDS_RRATE), ri); StSel(C(IDS_RDITH), rc->dither + 1);
+        StTog(C(IDS_RMT), rc->multitrack != 0); StTog(C(IDS_RBP), rc->bitperfect); StSel(C(IDS_RPRE), StIdx(ST_PRE, 5, (int)rc->preRoll)); StSel(C(IDS_RSPLIT), StIdx(ST_SPLIT, 5, (int)rc->splitMin));
+        StSel(C(IDS_AMODE), rc->alp.mode); StSel(C(IDS_ATARGET), StIdx(ST_TARGET, 6, (int)rc->alp.targetLufs)); StSel(C(IDS_ABOOST), StIdx(ST_BOOST, 6, (int)rc->alp.maxBoostDb));
+        int ci = 3; for (int i = 0; i < 6; i++) if (std::fabs(ST_CEIL[i] - rc->alp.ceilingDb) < 0.01) ci = i; StSel(C(IDS_ACEIL), ci); StSel(C(IDS_ASPEED), rc->alp.speed);
+        std::wstring t = r->name + L"\r\n" + RecStatusLine(r); swprintf(b, 400, L"\r\nClips: %u · Latenz Auto-Pegel ≈ %.1f ms%ls", (unsigned)rc->al.clips(), 1000.0 * rc->al.latencyFrames() / std::max(1, rc->rate), rc->bitperfect ? L" · bit-perfekt: keine Verarbeitung" : L""); t += b;
+        SetWindowTextW(C(IDS_RSTAT), t.c_str());
+    } else SetWindowTextW(C(IDS_RSTAT), L"Keine Aufnahme-Box im Graph – „● Aufnahme-Box“ aus der Toolbar aufs Feld ziehen.");
+    StTog(C(IDS_VON), g_vbWanted.load()); StSel(C(IDS_VLAYOUT), g_vbLayout.load());
+    std::wstring vs = g_vb ? L"Brücke an" : L"Brücke aus";
+    if (g_vb) { bool drv = g_vb->driverOn.load() && vbus::Fresh(g_vb->driverBeatNs.load(), vbus_win::NowNs()); swprintf(b, 400, L" · DAW %ls · %d Hz · Puffer %u", drv ? L"verbunden" : L"nicht verbunden", (int)g_vb->rate.load(), (unsigned)g_vb->bufFrames.load()); vs += b; }
+    vs += DriverInstalled() ? L"\r\nASIO-Treiber „Bens Virtual Bus“ ist installiert." : L"\r\nASIO-Treiber ist nicht installiert (Taste unten).";
+    SetWindowTextW(C(IDS_VSTAT), vs.c_str());
+}
+static LRESULT CALLBACK StudioDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_CREATE: {
+        auto lab = [&](const wchar_t* t, int x, int y, int ww, int hh = 22, int id = 0, bool bold = false) { HWND c = WMk(h, L"STATIC", t, SS_LEFT | SS_NOPREFIX, x, y, ww, hh, id); if (bold) SendMessageW(c, WM_SETFONT, (WPARAM)g_fBold, TRUE); return c; };
+        auto tog = [&](const wchar_t* t, int x, int y, int ww, int id) { HWND c = CreateWindowExW(0, L"BARToggle", t, WS_CHILD | WS_VISIBLE | WS_TABSTOP, S(x), S(y), S(ww), S(28), h, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr); SendMessageW(c, WM_SETFONT, (WPARAM)g_fUI, TRUE); return c; };
+        auto cmb = [&](int x, int y, int ww, int id, std::initializer_list<const wchar_t*> items) { HWND c = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, S(x), S(y), S(ww), S(240), h, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr); SendMessageW(c, WM_SETFONT, (WPARAM)g_fUI, TRUE); for (const wchar_t* t : items) SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)t); ThemeNative(c, 1); return c; };
+        auto btn = [&](const wchar_t* t, int x, int y, int ww, int id, bool accent = false) { HWND c = CreateWindowExW(0, L"BARBtn", t, WS_CHILD | WS_VISIBLE | WS_TABSTOP, S(x), S(y), S(ww), S(32), h, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr); SendMessageW(c, WM_SETFONT, (WPARAM)g_fUI, TRUE); if (accent) SendMessageW(c, BTM_SETFLAGS, BTN_ACCENT, 0); return c; };
+        // ---- links
+        lab(L"Live-Modus – kleinste Latenz für Eingänge → Ausgänge", 20, 12, 520, 22, 0, true);
+        tog(L"Live-Modus einschalten (Niedriglatenz-Pfad, 1-ms-Takt)", 20, 40, 520, IDS_LIVE);
+        tog(L"Automatisch: so klein wie stabil (wächst bei Aussetzern)", 20, 72, 520, IDS_LAUTO);
+        lab(L"Router-Puffer in ms (Start bzw. fest):", 20, 110, 300); cmb(330, 106, 120, IDS_LMS, {L"2", L"3", L"4", L"6", L"8", L"12", L"16", L"24", L"32", L"40"});
+        lab(L"", 20, 142, 520, 84, IDS_LSTAT);
+        lab(L"Ausgewählter Ein-/Ausgang (Pro-Audio)", 20, 234, 520, 22, 0, true); lab(L"", 20, 260, 520, 20, IDS_NHINT);
+        tog(L"Exklusiv (Windows-Mixer umgehen, bit-genau, Gerät gehört dem Router)", 20, 284, 520, IDS_NEXCL);
+        tog(L"Live: ohne Ausgleichs-Delay (Autopilot) – nur Live-Latenz", 20, 314, 520, IDS_NLIVE);
+        lab(L"Exklusiv-Samplerate:", 20, 354, 300); cmb(330, 350, 160, IDS_NRATE, {L"Gerätestandard", L"44100 Hz", L"48000 Hz", L"88200 Hz", L"96000 Hz", L"176400 Hz", L"192000 Hz", L"352800 Hz", L"384000 Hz"});
+        lab(L"Kanalpaar (Mehrkanal-Eingang):", 20, 390, 300); cmb(330, 386, 160, IDS_NPAIR, {L"1/2", L"3/4", L"5/6", L"7/8", L"9/10", L"11/12", L"13/14", L"15/16"});
+        lab(L"Virtuelle Eingänge (ASIO-Treiber, 16 Kanäle)", 20, 438, 520, 22, 0, true);
+        tog(L"Brücke einschalten (DAW ↔ Router)", 20, 466, 520, IDS_VON);
+        lab(L"Surround-Zuordnung:", 20, 506, 170); { HWND c = cmb(190, 502, 350, IDS_VLAYOUT, {}); for (int i = 0; i < vbus::NLAYOUTS; i++) SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)W8(vbus::GetLayout(i).title).c_str()); }
+        btn(L"8 virtuelle Eingänge", 20, 542, 170, IDS_VIN); btn(L"8 virtuelle Ausgänge", 196, 542, 170, IDS_VOUT); btn(L"Surround-Downmix", 372, 542, 168, IDS_VDOWN);
+        lab(L"", 20, 584, 520, 44, IDS_VSTAT);
+        btn(L"Treiber installieren…", 20, 640, 250, IDS_VDRVI, true); btn(L"Treiber entfernen…", 290, 640, 250, IDS_VDRVR);
+        // ---- rechts
+        lab(L"Aufnahme-Box (Studio-Recording)", 580, 12, 520, 22, 0, true);
+        lab(L"Format:", 580, 48, 230); cmb(820, 44, 280, IDS_RFMT, {L"WAV 24 Bit (empfohlen)", L"FLAC 24 Bit", L"FLAC 16 Bit", L"WAV 16 Bit (mit Dither)", L"WAV 32 Bit Float", L"WAV 32 Bit Ganzzahl"});
+        lab(L"Samplerate:", 580, 84, 230); cmb(820, 80, 280, IDS_RRATE, {L"44100 Hz", L"48000 Hz", L"88200 Hz", L"96000 Hz", L"176400 Hz", L"192000 Hz", L"352800 Hz", L"384000 Hz"});
+        lab(L"Dither:", 580, 120, 230); cmb(820, 116, 280, IDS_RDITH, {L"automatisch (16 Bit an)", L"aus", L"TPDF"});
+        tog(L"Mehrspur (jedes Kabel = Stereo-Paar, bis 16 Kanäle)", 580, 152, 520, IDS_RMT);
+        tog(L"Bit-perfekt (eine Quelle, Quelltakt, unverändert)", 580, 182, 520, IDS_RBP);
+        lab(L"Vorlauf (Pre-Record):", 580, 222, 230); cmb(820, 218, 280, IDS_RPRE, {L"aus", L"2 s", L"5 s", L"10 s", L"30 s"});
+        lab(L"Datei teilen nach:", 580, 258, 230); cmb(820, 254, 280, IDS_RSPLIT, {L"nie (eine Datei)", L"10 min", L"30 min", L"60 min", L"120 min"});
+        lab(L"Auto-Pegel (Lautstärke angleichen, nie übersteuern)", 580, 304, 520, 22, 0, true);
+        lab(L"Modus:", 580, 336, 230); cmb(820, 332, 280, IDS_AMODE, {L"aus", L"nur Limiter (Schutz)", L"Pegeln + Limiter"});
+        lab(L"Ziel-Lautheit:", 580, 372, 230); cmb(820, 368, 280, IDS_ATARGET, {L"−23 LUFS", L"−20 LUFS", L"−18 LUFS", L"−16 LUFS", L"−14 LUFS", L"−12 LUFS"});
+        lab(L"Max. Anhebung:", 580, 408, 230); cmb(820, 404, 280, IDS_ABOOST, {L"0 dB", L"6 dB", L"12 dB", L"18 dB", L"24 dB", L"30 dB"});
+        lab(L"Limiter-Decke:", 580, 444, 230); cmb(820, 440, 280, IDS_ACEIL, {L"−6 dBTP", L"−3 dBTP", L"−2 dBTP", L"−1 dBTP", L"−0,5 dBTP", L"0 dBTP"});
+        lab(L"Reaktion:", 580, 480, 230); cmb(820, 476, 280, IDS_ASPEED, {L"langsam", L"normal", L"schnell"});
+        lab(L"", 580, 522, 520, 96, IDS_RSTAT); btn(L"Spitzenwerte zurücksetzen", 580, 628, 250, IDS_RRESET);
+        lab(L"Tipp: „Nur Limiter“ schützt vor Übersteuern, ohne die Dynamik zu ändern. Bit-perfekt schaltet jede Verarbeitung ab.", 580, 668, 520, 40, IDS_RHINT);
+        SetTimer(h, 1, 300, nullptr); StudioRefresh(h); return 0; }
+    case WM_TIMER: StudioRefresh(h); return 0;
+    case WM_COMMAND: {
+        int id = LOWORD(w), code = HIWORD(w); auto C = [&](int i) { return GetDlgItem(h, i); };
+        auto cv = [&](int cid, const int* a, int cnt) { int i = (int)SendMessageW(C(cid), CB_GETCURSEL, 0, 0); return i >= 0 && i < cnt ? a[i] : 0; };
+        auto sel = [&](int cid) { return (int)SendMessageW(C(cid), CB_GETCURSEL, 0, 0); };
+        auto tg = [&](int cid) { return SendMessageW(C(cid), TGM_GET, 0, 0) != 0; };
+        std::string err; Node* nd = g_sel; Node* r = StudioRecNode();
+        auto recSet = [&](const char* key, double v) { if (!r) return; if (!CtlRecSet(r, key, v, err)) { MessageBoxW(h, W8(err).c_str(), APP_NAME, MB_ICONINFORMATION); } StudioRefresh(h); };
+        auto nodeSet = [&](const char* key, double v, bool b) { if (!nd) return; int rc = CtlNodeSet(nd, key, v, true, true, b, err); if (rc < 0) MessageBoxW(h, W8(err).c_str(), APP_NAME, MB_ICONINFORMATION); StudioRefresh(h); };
+        switch (id) {
+        case IDS_LIVE: CtlLive(tg(IDS_LIVE) ? 1 : 0, -1, -1); break;
+        case IDS_LAUTO: CtlLive(-1, tg(IDS_LAUTO) ? 1 : 0, -1); break;
+        case IDS_LMS: if (code == CBN_SELCHANGE) CtlLive(-1, -1, cv(IDS_LMS, ST_MS, 10)); break;
+        case IDS_NEXCL: nodeSet("excl", 0, tg(IDS_NEXCL)); break;
+        case IDS_NLIVE: nodeSet("liveDirect", 0, tg(IDS_NLIVE)); break;
+        case IDS_NRATE: if (code == CBN_SELCHANGE) nodeSet("exRate", cv(IDS_NRATE, ST_XRATE, 9), false); break;
+        case IDS_NPAIR: if (code == CBN_SELCHANGE) nodeSet("inPair", sel(IDS_NPAIR), false); break;
+        case IDS_RFMT: if (code == CBN_SELCHANGE) recSet("fmt", sel(IDS_RFMT)); break;
+        case IDS_RRATE: if (code == CBN_SELCHANGE) recSet("rate", REC_RATES[std::max(0, std::min(7, sel(IDS_RRATE)))]); break;
+        case IDS_RDITH: if (code == CBN_SELCHANGE) recSet("dither", sel(IDS_RDITH) - 1); break;
+        case IDS_RMT: recSet("multitrack", tg(IDS_RMT) ? 1 : 0); break;
+        case IDS_RBP: recSet("bitperfect", tg(IDS_RBP) ? 1 : 0); break;
+        case IDS_RPRE: if (code == CBN_SELCHANGE) recSet("preRoll", cv(IDS_RPRE, ST_PRE, 5)); break;
+        case IDS_RSPLIT: if (code == CBN_SELCHANGE) recSet("splitMin", cv(IDS_RSPLIT, ST_SPLIT, 5)); break;
+        case IDS_AMODE: if (code == CBN_SELCHANGE) recSet("alMode", sel(IDS_AMODE)); break;
+        case IDS_ATARGET: if (code == CBN_SELCHANGE) recSet("alTarget", cv(IDS_ATARGET, ST_TARGET, 6)); break;
+        case IDS_ABOOST: if (code == CBN_SELCHANGE) recSet("alBoost", cv(IDS_ABOOST, ST_BOOST, 6)); break;
+        case IDS_ACEIL: if (code == CBN_SELCHANGE) recSet("alCeil", ST_CEIL[std::max(0, std::min(5, sel(IDS_ACEIL)))]); break;
+        case IDS_ASPEED: if (code == CBN_SELCHANGE) recSet("alSpeed", sel(IDS_ASPEED)); break;
+        case IDS_RRESET: recSet("alReset", 0); break;
+        case IDS_VON: CtlVBus(tg(IDS_VON) ? 1 : 0, -1); break;
+        case IDS_VLAYOUT: if (code == CBN_SELCHANGE) CtlVBus(-1, sel(IDS_VLAYOUT)); break;
+        case IDS_VIN: { if (!g_vbWanted) CtlVBus(1, -1); int a = CtlAddVirtual(K_VIN, -1); g_msg = a ? L"Virtuelle Eingänge angelegt – DAW-Ausgänge erscheinen als Quellen im Graph." : L"Alle 8 virtuellen Eingänge sind schon vorhanden."; break; }
+        case IDS_VOUT: { if (!g_vbWanted) CtlVBus(1, -1); int a = CtlAddVirtual(K_VOUT, -1); g_msg = a ? L"Virtuelle Ausgänge angelegt – Router-Signale erscheinen in der DAW als Eingänge." : L"Alle 8 virtuellen Ausgänge sind schon vorhanden."; break; }
+        case IDS_VDOWN: { if (!g_vbWanted) CtlVBus(1, -1); int a = CtlAddVirtual(K_VIN, 99); g_msg = a ? L"Surround-Downmix-Quellen angelegt." : L"Diese Zuordnung hat keine Surround-Gruppe (oder sie ist schon angelegt)."; break; }
+        case IDS_VDRVI: { std::wstring msg; DriverInstallElevated(msg); MessageBoxW(h, msg.c_str(), APP_NAME, MB_ICONINFORMATION); break; }
+        case IDS_VDRVR: { std::wstring msg; DriverRemoveElevated(msg); MessageBoxW(h, msg.c_str(), APP_NAME, MB_ICONINFORMATION); break; }
+        }
+        InvalidateRect(g_canvas, nullptr, FALSE); StudioRefresh(h); return 0; }
+    case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); RECT r; GetClientRect(h, &r); HBRUSH bg = CreateSolidBrush(TH.bg); FillRect(dc, &r, bg); DeleteObject(bg); EndPaint(h, &ps); return 0; }
+    case WM_ERASEBKGND: return 1;
+    case WM_CTLCOLORSTATIC: SetTextColor((HDC)w, TH.text); SetBkColor((HDC)w, TH.bg); return (LRESULT)g_brBg;
+    case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: SetTextColor((HDC)w, TH.text); SetBkColor((HDC)w, TH.surface); return (LRESULT)g_brSurface;
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_DESTROY: KillTimer(h, 1); g_studioDlg = nullptr; return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void StudioDlgOpen() {
+    if (g_studioDlg) { SetForegroundWindow(g_studioDlg); return; } static bool reg = false;
+    if (!reg) { WNDCLASSEXW c = {sizeof(c)}; c.lpfnWndProc = StudioDlgProc; c.hInstance = GetModuleHandleW(nullptr); c.hCursor = LoadCursorW(nullptr, IDC_ARROW); c.lpszClassName = L"BARStudioDlg"; c.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1)); RegisterClassExW(&c); reg = true; }
+    RECT pr; GetWindowRect(g_hwnd, &pr);
+    g_studioDlg = CreateWindowExW(0, L"BARStudioDlg", L"Studio – Live, HiRes-Aufnahme, Auto-Pegel, virtuelle Eingänge", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE, pr.left + S(40), pr.top + S(40), S(1130) + 16, S(730) + 40, g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    BOOL d = TH.dark; DwmSetWindowAttribute(g_studioDlg, 20, &d, sizeof d);
+}
+
 // ======================================================================= Hintergrund-Betrieb: Tray-Symbol, Autostart, Schliessen = im Tray weiterlaufen
 static const UINT WM_TRAY = WM_APP + 41, WM_SHOWME = WM_APP + 42;
 static UINT g_wmTaskbar = 0; static bool g_quit = false, g_trayOn = false, g_trayHinted = false;
@@ -3745,6 +4512,7 @@ static void HandleCommand(int id, int code, HWND src) {
     case IDC_BTN_STREAM: ShowStreamMenu(); break;
     case IDC_BTN_MORE: ShowMoreMenu(); break;
     case IDC_BTN_BG: ShowBgMenu(); break;
+    case IDC_BTN_STUDIO: case IDC_I_STUDIO: StudioDlgOpen(); break;
     case IDC_BTN_WEB: WebDlgOpen(); break;
     case IDC_BTN_REC:
     case IDC_BTN_SUM:
@@ -3852,18 +4620,18 @@ static void HandleCommand(int id, int code, HWND src) {
     case IDC_I_RECFMT:
         if (n && n->rc && code == CBN_SELCHANGE && !n->rc->rec.active()) {
             int i = (int)SendMessageW(iRecFmt, CB_GETCURSEL, 0, 0);
-            n->rc->flac = (i == 1 || i == 2);   // 0 WAV24, 1 FLAC24, 2 FLAC16, 3 WAV16, 4 WAV32f
-            n->rc->bits = (i == 2 || i == 3) ? 16 : i == 4 ? 32 : 24;
+            if ((i == 1 || i == 2) && n->rc->multitrack) { g_msg = L"FLAC kennt nur Stereo – erst Mehrspur ausschalten."; FillRecCtl(n); break; }
+            n->rc->flac = (i == 1 || i == 2);   // 0 WAV24, 1 FLAC24, 2 FLAC16, 3 WAV16, 4 WAV32f, 5 WAV32 Ganzzahl
+            n->rc->bits = (i == 2 || i == 3) ? 16 : (i == 4 || i == 5) ? 32 : 24; n->rc->int32 = (i == 5);
             RefreshRecCtl(n);
             SaveGraph();
         }
         break;
     case IDC_I_RECRATE:
         if (n && n->rc && code == CBN_SELCHANGE && !n->rc->rec.active()) {
-            static const int R[4] = {44100, 48000, 88200, 96000};
-            int i = std::max(0, std::min(3, (int)SendMessageW(iRecRate, CB_GETCURSEL, 0, 0)));
-            n->rc->rate = R[i];
-            n->rate = R[i];
+            int i = std::max(0, std::min(7, (int)SendMessageW(iRecRate, CB_GETCURSEL, 0, 0)));
+            n->rc->rate = REC_RATES[i];
+            n->rate = REC_RATES[i];
             ReopenNode(n);   // Takt der Box mit neuer Samplerate neu aufsetzen
             RefreshRecCtl(n);
             SaveGraph();
@@ -4196,6 +4964,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETTINGCHANGE:
         if (g_themeMode == 0 && lp && wcscmp((const wchar_t*)lp, L"ImmersiveColorSet") == 0) ApplyThemeNow();
         return 0;
+    case WM_DRVDONE: { std::wstring* m = (std::wstring*)lp; if (m) { g_msg = *m; delete m; } InvalidateRect(g_canvas, nullptr, FALSE); return 0; }
     case WM_APP + 30:
         g_msg = L"FLAC wurde vom Sonos nicht akzeptiert – automatisch auf WAV 16 Bit umgestellt.";
         UpdateInspector();
@@ -4319,6 +5088,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nShow) {
+    if (cmdLine && wcsstr(cmdLine, L"--driver-install")) return DriverCli(true);   // Treiber-Modus (Administrator), kein Fenster
+    if (cmdLine && wcsstr(cmdLine, L"--driver-remove")) return DriverCli(false);
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"BensAudioRouter3_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND other = nullptr; EnumWindows(FindMainProc, (LPARAM)&other);   // laufende Instanz (auch im Tray) nach vorn holen
@@ -4333,7 +5104,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nShow) {
     InitializeCriticalSection(&g_sonosCs);
     g_logT0 = NowSec();
     g_log = _wfopen((AppDir() + L"\\log.txt").c_str(), L"wb");
-    Log("Bens Audio Router 4.5 gestartet (Buccloud Software (DE))");
+    Log("Bens Audio Router 5.0 gestartet (Buccloud Software (DE))");
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
