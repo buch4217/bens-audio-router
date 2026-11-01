@@ -2,7 +2,7 @@
 
 # Bens Audio Router
 
-![Lizenz](https://img.shields.io/badge/Lizenz-MIT-blue) ![Plattform](https://img.shields.io/badge/Plattform-Windows%2010%2F11%20x64-0078d4) ![Version](https://img.shields.io/badge/Version-4.5-brightgreen) ![Status](https://img.shields.io/badge/Status-Open%20Source-orange)
+![Lizenz](https://img.shields.io/badge/Lizenz-MIT-blue) ![Plattform](https://img.shields.io/badge/Plattform-Windows%2010%2F11%20x64-0078d4) ![Version](https://img.shields.io/badge/Version-5.0-brightgreen) ![Status](https://img.shields.io/badge/Status-Open%20Source-orange)
 
 **Audiophiler Node-Router für Windows – Mitschnitt, lokale Ausgänge und Sonos-Streaming mit automatischem Latenz-Ausgleich.**
 
@@ -34,6 +34,10 @@ einer Quelle zu mehreren Ausgängen – zum Beispiel vom PC zum lokalen Studio *
 | **Summen-Modul** | Für Mono-Eingänge: zwei Mono-Quellen werden als **Links/Rechts** zugeordnet (je Kabel: Kanal der Quelle → Links, Rechts, Mitte oder Stereo). Beim Mischen aufgelöst: **keine zusätzliche Latenz**, der Autopilot rechnet wie mit direkten Kabeln |
 | **Hintergrund-Betrieb** | **Tray-Symbol**, **Autostart mit Windows**, „Schließen = im Tray weiterlaufen“, versteckter Start, Engine startet automatisch; eine zweite Programmstart holt das laufende Fenster nach vorn |
 | **Web-Interface (Handy)** | Router am **Handy bedienen**: Mixer mit Live-Pegeln, **Matrix-Patchbay** zum Verkabeln per Tippen, Graph mit Pinch-Zoom, Szenen, REC, Autopilot. Nur **HTTPS** (eigene lokale CA), Kopplung per QR-Code und Einmal-Code, nur im privaten Netz, standardmäßig aus |
+| **Live-Modus** | Kleinste Latenz für Eingänge → Ausgänge (z. B. DJ-Mixer-Fader): Niedriglatenz-Pfad (IAudioClient3) oder **Exklusiv-Modus**, 1-ms-Takt, **adaptiver Puffer** („so klein wie stabil“, 2–40 ms), kein Ausgleichs-Delay auf lokalen Ausgängen |
+| **Auto-Pegel** | Aufnahme nie zu leise, nie übersteuert: **Lautheits-Leveler (BS.1770)** + **True-Peak-Limiter**, Zielpegel, Decke und Reaktion einstellbar, Messwerte live |
+| **HiRes-Aufnahme** | bis **384 kHz**, WAV 16/24/32 (Float oder Ganzzahl), FLAC, **bit-genau**, **Mehrspur bis 16 Kanäle**, **Bit-perfekt-Modus**, Vorlauf (Pre-Record), Dateiteilung, BWF-Zeitstempel |
+| **Virtueller ASIO-Treiber** | **„Bens Virtual Bus“**: 16 Kanäle = **8 Stereo-Eingänge aus der DAW + 8 Stereo-Ausgänge zur DAW**, Surround-Zuordnung (5.1, 7.1, 7.1.4 …) mit Stereo-Downmix. In der EXE eingebettet, per Taste installiert, reiner User-Mode-Treiber |
 | **Modernes UI** | Natives Dark-Mode (auch Titelleiste und Menüs), Auto/Dunkel/Hell |
 
 ## Download
@@ -55,7 +59,8 @@ Die vollständige Bedienung steht in der **[Anleitung](docs/Anleitung.md)** (auc
 ## Systemvoraussetzungen
 
 - Windows 10 (1903+) oder Windows 11, 64 Bit
-- Für lokales Routing mit eigenem Gerät: virtueller Audiotreiber (z. B. VB-Audio HIFI-CABLE)
+- Für lokales Routing mit eigenem Gerät: virtueller Audiotreiber (z. B. VB-Audio HIFI-CABLE) – **oder** der mitgelieferte ASIO-Treiber „Bens Virtual Bus“ für DAWs (Installation per Taste in „Studio…“, einmalige Administrator-Bestätigung)
+- Für den Live-Modus mit minimaler Latenz: Windows 10 (Niedriglatenz-Shared) bzw. ein Audiogerät mit Exklusiv-Modus; die erreichbare Latenz hängt vom Gerätetreiber ab
 - Für Sonos: Sonos S2 oder S1 im selben Netzwerk (UPnP); Windows-Firewall: privates Netz freigeben
 
 ## Aus dem Quelltext bauen
@@ -64,11 +69,12 @@ Cross-Compile unter Linux mit MinGW-w64 (oder unter Windows mit MSYS2):
 
 ```bash
 sudo apt install g++-mingw-w64-x86-64
-cd src && ./build.sh        # erzeugt BensAudioRouter.exe
+cd src && ./build.sh        # baut zuerst den ASIO-Treiber (../driver), bettet ihn ein und erzeugt BensAudioRouter.exe
+tests/run_all.sh            # alle Tests (nativ; ASIO-Treiber-Tests laufen mit Wine, falls vorhanden)
 ```
 
 Aufbau: `BensAudioRouter.cpp` (App), `core.h` (DSP), `flac.h` (FLAC-Encoder), `calib.h` (Einmessung), `stream.h` (Sonos/UPnP/HTTP), `airplay.h` + `ap_crypto.h` (AirPlay-Empfänger), `alac.c` (ALAC-Decoder), `wavrec.h` (WAV/FLAC-Rekorder der Aufnahme-Box), `route.h` (Kanal-Matrix des Summen-Moduls), `webcore.h` + `webwin.h` + `qr.h` + `web/` (Web-Interface: Server-Kern, TLS/CA, QR-Kopplung, mobile Web-App),
-`ui.h` (Theme und Controls), `tests/` (Kern-Tests), `tools/mock_sonos.py` (Sonos-Simulator) und `tools/raop_test_sender.py` (AirPlay-Testsender).
+`ui.h` (Theme und Controls), `dyn.h` (Auto-Pegel: Lautheit, True-Peak-Limiter), `vbus.h` + `vbus_win.h` (virtuelle Brücke), `livectl.h` (adaptive Live-Latenz), `driver/` (ASIO-Treiber „Bens Virtual Bus“), `tests/` (Kern-Tests), `tools/mock_sonos.py` (Sonos-Simulator) und `tools/raop_test_sender.py` (AirPlay-Testsender).
 
 ## Status und Roadmap
 
